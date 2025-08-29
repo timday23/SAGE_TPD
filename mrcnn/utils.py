@@ -18,11 +18,13 @@ import scipy
 import skimage.color
 import skimage.io
 import skimage.transform
+import cv2
 import urllib.request
 import shutil
 import warnings
 from distutils.version import LooseVersion
-
+from tqdm.notebook import tqdm
+from PIL import Image
 
 #confusion matrix 
 
@@ -32,10 +34,14 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from matplotlib.collections import QuadMesh
 import seaborn as sn
+import seaborn as sns
 from sklearn.metrics import confusion_matrix
 from pandas import DataFrame
 from string import ascii_uppercase
-
+import mrcnn.model as modellib
+import pandas as pd
+import StereoFractAnalyzer as SF
+import tempfile
 
 # URL from which to download the latest COCO trained weights
 COCO_MODEL_URL = "https://github.com/matterport/Mask_RCNN/releases/download/v2.0/mask_rcnn_coco.h5"
@@ -943,7 +949,1210 @@ def resize(image, output_shape, order=1, mode='constant', cval=0, clip=True,
             preserve_range=preserve_range)
 
     
-#### COnfusion matrix
+
+
+###### Added utils for SAGE ########
+
+class SAGEDataset(Dataset):
+    """Load Dataset
+    """
+    def __init__(self,images_dir, particle_masks_dir, cluster_masks_dir, load_particle=True, load_cluster=True):
+        super().__init__()
+        self.images_dir = images_dir
+        self.particle_masks_dir = particle_masks_dir
+        self.cluster_masks_dir = cluster_masks_dir
+        self.load_particle = load_particle  # Correctly initialize the attribute
+        self.load_cluster = load_cluster  # Correctly initialize the attribute
+   
+        if load_particle and load_cluster:
+            self.class_names = ["particle", "cluster"]
+            self.add_class("SAGE",1,"particle") #add particle class
+            self.add_class("SAGE",2,"cluster") #add cluster class 
+        elif load_particle:
+            self.class_names=["particle"]
+            self.add_class("SAGE",1,"particle") #add particle class
+        elif load_cluster:
+            self.class_names=["cluster"]
+            self.add_class("SAGE",1,"cluster") #add cluster class 
+            
+        #print(self.class_names)
+    
+    def load_dataset(self, dataset_name=None, mask_position=2):
+        """Load images and masks from specified directories."""
+        #load images
+        image_filenames = [f for f in os.listdir(self.images_dir) if f.endswith('.png')]
+        #print(f"unsorted: {image_filenames}")
+        #sort them by number
+        image_filenames.sort(key=lambda x: int(x.split('_')[1].split('.')[0]))
+        #print(f"Sorted: {image_filenames}")
+        
+        for image_id, filename in enumerate(image_filenames):
+            #tqdm(image_filenames, desc="Adding images", dynamic_ncols=True,position=1)):   removing because it already loads fast
+            image_path = os.path.join(self.images_dir, filename)
+            image_no = filename.split('_')[1] #get image number
+            basename = os.path.splitext(filename)[0] 
+            #print(basename)
+            self.add_image("SAGE", image_id=image_id, path=image_path,basename=basename,width=None, height=None)
+            
+        #load masks for each image
+        desc = f"Loading masks for {dataset_name}" if dataset_name else "Loading masks"
+        for image_id in tqdm(range(len(self.image_info)), desc=desc, dynamic_ncols=True, position=mask_position, leave=False):
+            #print(f"Loading Masks for Image {image_id}", end="\r")
+            #sys.stdout.flush()
+            self.load_mask(image_id)
+
+        
+
+    def load_image(self, image_id):
+        """ Load an image from the dataset."""
+        info = self.image_info[image_id]
+        image = cv2.imread(info['path'])
+        return image
+
+    def image_reference(self, image_id):
+        """Return the particle data of the image."""
+        info = self.image_info[image_id]
+        if info["source"] == "SAGE":
+            return info["path"]
+        else:
+            return super(self.__class__).image_reference(self, image_id)
+
+    def load_mask(self, image_id):
+        """load instance masks for the particle of the given image ID."""
+        
+        info = self.image_info[image_id]
+        masks = []
+        class_ids = []
+        
+        if self.load_particle and self.load_cluster:
+            masks_particle, class_ids_particle = self._load_class_masks(info, self.particle_masks_dir, 
+                                                                        class_id=1,pattern='particle')
+            #if masks_particle:
+                #print(f"Loaded {len(masks_particle)} particle masks for Image ID {image_id}.")
+            masks.extend(masks_particle)
+            class_ids.extend(class_ids_particle)
+            
+            masks_cluster, class_ids_cluster = self._load_class_masks(info, self.cluster_masks_dir, 
+                                                                      class_id=2,pattern='cluster')
+            #if masks_cluster:
+               # print(f"Loaded {len(masks_cluster)} cluster masks for Image ID {image_id}.")
+            masks.extend(masks_cluster)
+            class_ids.extend(class_ids_cluster)
+            #print("Both particle and cluster masks")
+            
+        #particle masks
+        elif self.load_particle:
+            masks_particle, class_ids_particle = self._load_class_masks(info, self.particle_masks_dir, 
+                                                                        class_id=1,pattern='particle')
+            #if masks_particle:
+                #print(f"Loaded {len(masks_particle)} particle masks for Image ID {image_id}.")
+            masks.extend(masks_particle)
+            class_ids.extend(class_ids_particle)
+            #rint("only particle masks")
+            
+        #cluster masks
+        elif self.load_cluster:
+            masks_cluster, class_ids_cluster = self._load_class_masks(info, self.cluster_masks_dir, 
+                                                                      class_id='1',pattern='cluster')
+            #if masks_cluster:
+               # print(f"Loaded {len(masks_cluster)} cluster masks for Image ID {image_id}.")
+            masks.extend(masks_cluster)
+            class_ids.extend(class_ids_cluster)
+           #print(("only cluster masks"))
+            
+        #combine masks into 3d array
+        if masks:
+            combined_mask = np.stack(masks, axis =-1)
+            return combined_mask, np.array(class_ids, dtype=np.int32)
+                      
+        #print(f" No masks found for image ID {image_id}.")
+        return np.zeros((0,0), dtype=np.bool_),np.zeros((0,),dtype=np.int32)
+
+    
+    def _load_class_masks(self,info, masks_dir, class_id, pattern):
+        """Load msks for a specific class based on a pattern"""
+        
+        masks = []
+        class_ids = []
+        
+        #construct mask filename based on image filename 
+        _, image_filename = os.path.split(info['path']) 
+        image_no = image_filename.split('_')[1].replace('.png','') #extract the base name without the extension to form mask filename
+        #print(image_no)
+        #print(f"Loading masks for image number:{image_no}")
+        
+        #load all masks for the current image
+       
+        
+        if pattern =='particle':
+            i = 0
+            first_mask_found = False
+            while True: 
+                mask_filename = f"mask_{image_no}_{i:06d}.png"
+                mask_path = os.path.join(masks_dir, mask_filename)
+                
+                if os.path.exists(mask_path):
+                    #print(f"Found mask file: {mask_path}")
+                    first_mask_found=True
+                    mask = cv2.imread(mask_path,cv2.IMREAD_GRAYSCALE) #load mask
+                    if mask is not None:
+                        masks.append(mask.astype(np.bool_))
+                        class_ids.append(class_id)
+                    i += 1
+                elif not first_mask_found:
+                    i=1
+                    continue
+                else:
+                    #print(f"Mask file not found: {mask_path}")
+                    break
+        elif pattern == 'cluster':
+            # For clusters, load only one mask
+            mask_filename = f"mask_{image_no}.png"
+            mask_path = os.path.join(masks_dir, mask_filename)
+            #print(f"Checking path for mask: {mask_path}")
+
+            if os.path.exists(mask_path):
+                #print(f"Found mask file: {mask_path}")
+                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE) # Load mask
+                if mask is not None:
+                    masks.append(mask.astype(np.bool_))
+                    class_ids.append(class_id)
+            else:
+                print(f"Mask file not found: {mask_path}")
+        
+        return masks, class_ids
+                                 
+        
+                     
+
+def create_dataset_results_dirs(dataset_name, results_dir):
+    """creates the full results directory subfolders for given dataset
+    Params:
+    - dataset_name(str): name of dataset (e.g. D1e1_test)
+    - results_dir (str): path to main results folder
+    
+    returns:
+    -str: path to dataset's results directories
+    """
+    
+    dataset_dir = os.path.join(results_dir,dataset_name)
+    
+    subdirs = [
+        os.path.join(dataset_dir, "PP_Info"),
+        os.path.join(dataset_dir, "Visualizations"),
+        os.path.join(dataset_dir, "IoUs")
+    ]
+    
+    for path in subdirs:
+        os.makedirs(path, exist_ok=True)
+    #print("Directories Created")
+    return dataset_dir
+
+def load_and_register_dataset(dataset_name, ROOT_DIR, results_dir, load_particle=True, load_cluster=False, create_dirs=True):
+  
+    images_anlyz_dir =  os.path.join(ROOT_DIR, 'data', dataset_name)    
+    particle_masks_anlyz_dir = os.path.join(images_anlyz_dir, 'particle')
+    cluster_masks_anlyz_dir = os.path.join(images_anlyz_dir, 'cluster')
+    
+    if create_dirs:                      
+        dataset_results_dir = create_dataset_results_dirs(dataset_name, results_dir)
+    #initalize and load dataset
+    
+    dataset_analyze = SAGEDataset(images_anlyz_dir,particle_masks_anlyz_dir, cluster_masks_anlyz_dir,
+                                load_particle=load_particle, load_cluster=load_cluster)
+    
+    dataset_analyze.load_dataset(dataset_name=dataset_name)
+    dataset_analyze.prepare()
+    
+    #add loaded dataset to dictionary
+    #datasets[dataset_name] = dataset_analyze
+    
+    return dataset_analyze
+
+
+
+def print_loaded_datasets(loaded_datasets):
+    """
+    Prints the names of all the loaded datasets.
+    
+    Args:
+        loaded_datasets (dict): Dictionary of loaded datasets where keys are dataset names.
+        
+    Usage:
+        print_loaded_datasets(loaded_datasets)
+    """
+    if not loaded_datasets:
+        print("No datasets loaded.")
+        return
+    
+    print("Loaded Datasets:")
+    for dataset_name in loaded_datasets.keys():
+        print(f"- {dataset_name}")
+
+        
+def print_active_models(model_dict):
+    """
+    Prints the names of active models
+    Args: model_list (list): list of model names (strings)
+    usage:
+        print_active_models(model_list)
+    """
+    
+    if not model_dict:
+        print("No active models found")
+        return
+    for idx, (model_name, model_info) in enumerate(model_dict.items(), start=1):
+        model = model_info.get('model')  # Get the actual model object
+        threshold = model_info.get('confidence')  # Get the confidence threshold (if available)
+        
+        print(f"Model {idx}: {model_name}")
+        #print(f"  Model Object: {model}")  # Prints the model instance, could be customized further to show more details
+        print(f"  Confidence Threshold: {threshold}")
+        print("-" * 40)  # Separating line for readability
+    
+
+    
+def print_iou_summary(iou_df, model_name):
+    print(f"Model: {model_name}")
+    print(iou_df.head())
+    print(f"Count: {len(iou_df)}")
+    print(f"Range: {iou_df['iou'].min():.4f} - {iou_df['iou'].max():.4f}")
+    print(f"Mean: {iou_df['iou'].mean():.4f}")
+    
+def get_overlaps(model, dataset, config, iou_threshold=0, sort_method='iou', verbose=False,
+                 gt_set2 =None, filter=False):
+    
+    
+    iou_values = [] #list to store IoU values
+    
+    image_ids = dataset.image_ids
+    if not verbose:
+        image_ids = tqdm(image_ids, desc="Computing Overlaps", unit="img")
+        
+    for image_id in image_ids:
+        
+        #load GT data
+        image, image_meta, gt_class_ids, gt_bbox, gt_mask =\
+            modellib.load_image_gt(dataset, config, image_id)
+        
+        #if no model is passed, load second set of GT data
+        if model is None:
+            if gt_set2 is None:
+                raise ValueError("Either a model or second ground truth set must be provided")
+            #print("2nd dataset passed)")
+            _,_,gt_class_ids2, gt_bbox2, gt_mask2 =\
+                modellib.load_image_gt(gt_set2, config, image_id)
+            if filter:
+                gt_mask2 = filter_mask_size(gt_mask2, min_dp_pix = 18)
+            #calculate IoUs between GT masks    
+            overlaps = compute_overlaps_masks(gt_mask, gt_mask2)
+            
+            if verbose:
+                print(f"Image ID: {image_id}")
+                print(f"GT Set 1 Bboxes: {gt_bbox.shape[0]} (GT Boxes), GT Set 2 Bboxes: {gt_bbox2.shape[0]} (Pred Boxes)")
+                print(f"Overlaps matrix shape: {overlaps.shape}")
+                #print(f"Overlaps: {overlaps}")
+                #print(f"Predicted Scores: {len(r['scores'])} scores")
+                #print(f"gt_match: {gt_match}, pred_match: {pred_match}")
+                
+                
+        # if model is passed
+        else:
+            #print('Model Passed')
+            #run detection
+            results = model.detect([image], verbose=0)
+            r= results[0]
+
+        
+            if sort_method == 'confidence':
+            #print(f"ROIs: {len(r['rois'])}, Scores: {len(r['scores'])}")
+                gt_match, pred_match, overlaps = compute_matches(gt_bbox, gt_class_ids, gt_mask, 
+                                                             r["rois"], #pred bboxes
+                                                             r["class_ids"], #pred class ids
+                                                             r["scores"], #pred scores
+                                                             r["masks"], #pred masks
+                                                             iou_threshold=iou_threshold
+                                                            )
+            if sort_method == 'iou':
+                overlaps1 = compute_overlaps_masks(gt_mask, r['masks'])
+                
+                pseudo_scores = np.max(overlaps1,axis=0)
+                sorted_ix = np.argsort(pseudo_scores)[::-1]
+                
+                pred_boxes= r['rois'][sorted_ix]
+                pred_class_ids= r['class_ids'][sorted_ix]
+                pseudo_scores = pseudo_scores[sorted_ix]
+                pred_masks = r['masks'][..., sorted_ix]
+                
+                gt_match, pred_match, overlaps = compute_matches(gt_bbox, gt_class_ids, gt_mask, 
+                                                             pred_boxes, #pred bboxes
+                                                             pred_class_ids, #pred class ids
+                                                             pseudo_scores, #pred scores
+                                                             pred_masks, #pred masks
+                                                             iou_threshold=iou_threshold
+                                                            )
+        
+            if verbose:
+                print(f"Image ID: {image_id}")
+                print(f"Ground Truth Bboxes: {gt_bbox.shape[0]} (GT Boxes), Predicted Bboxes: {r['rois'].shape[0]} (Pred Boxes)")
+                print(f"Overlaps matrix shape: {overlaps.shape}")
+                #print(f"Overlaps: {overlaps}")
+                #print(f"Predicted Scores: {len(r['scores'])} scores")
+                #print(f"gt_match: {gt_match}, pred_match: {pred_match}")
+            max_iou_per_pred = {}
+        
+        for i in range(overlaps.shape[0]): #loop through pred boxes
+            for j in range(overlaps.shape[1]): #loop through gt boxes
+                if overlaps[i,j] >= iou_threshold:
+                    entry = {
+                        'image_id':dataset.image_info[image_id]['id'],
+                        'gt_index':j,
+                        'pred_index': i,
+                        'iou': overlaps[i,j]
+                        
+                    }
+                    
+                        
+                    iou_values.append(entry)
+                        #'confidence score': r['scores'][i] 
+                
+                        
+        #print(iou_values)
+    return iou_values
+
+
+def process_matches(model, dataset_analyze, inference_config, sort_method = 'iou',
+                    iou_threshold=0, verbose=False, dataset_analyze2=None, filter=False): 
+    """
+    Processes prediction/ground truth matches for each image based on IoU scores, and returns a filtered DataFrame of the matches
+    
+    Parameters:
+     
+    """
+    if model:
+        print("Model Passed")
+        if sort_method == 'confidence':
+            print("--> Confidence sort")
+            ious = get_overlaps(model=model,dataset=dataset_analyze, 
+                                config=inference_config,sort_method='confidence',
+                                 iou_threshold=iou_threshold,verbose=verbose)
+        else:
+            print("--> IoU sort")
+            ious = get_overlaps(model=model,dataset=dataset_analyze, 
+                                config=inference_config,sort_method='iou',
+                                 iou_threshold=iou_threshold,verbose=verbose)
+            
+    elif dataset_analyze2:
+        print("2nd Dataset Passed")
+        model=None
+        ious = get_overlaps(model=None, dataset=dataset_analyze, 
+                            config=inference_config, iou_threshold=iou_threshold, gt_set2=dataset_analyze2, filter = filter)
+    else:
+        raise ValueError("Either a model or second dataset must be provided.")
+    iou_df = pd.DataFrame(ious)
+    #sort by image_id, gt_index, and iou(descending) to prioritize best IoU matches
+    sorted_df = iou_df.sort_values(by=['image_id','iou'], ascending=[True, False])
+    #print(sorted_df)
+        
+
+
+    #list to store filtered results
+    unique_matches = []
+    
+    #iterate over each image id
+    image_ids = sorted_df['image_id'].unique()
+    if not verbose:
+        image_ids = tqdm(image_ids, desc="Filtering matches", unit="img")
+            
+    for image_id in image_ids:
+        if verbose:
+            print(f"Processing image_id:{image_id}")
+            
+        #get rowsfor current image id
+        image_df = sorted_df[sorted_df['image_id']==image_id]
+    
+        if verbose:
+            print(f"Dataframe for image_id {image_id}")
+            print(image_df.head(10))
+    
+        #track which GT and preds are already matched
+        matched_gt=set()
+        matched_preds=set() 
+    
+        match_counter = 0
+        skip_counter = 0
+    
+        for _, row in image_df.iterrows():
+            #print(f"checking row:{row.to_dict()}")
+            #print(f" Pred: {row['pred_index']} and GT: {row['gt_index']} IoU: {row['iou']}")
+            #if current GT box has not been matched and prediction has not been used
+            if row['pred_index'] not in matched_preds and row['gt_index'] not in matched_gt:
+                if verbose:
+                    print(f"--> Match found: Prediction {row['pred_index']} with GT {row['gt_index']}  (IoU: {row['iou']:.4f})")
+                match_counter +=1
+                
+                #add to list of unique matches
+                unique_matches.append(row)
+                #mark GT as matched
+                matched_gt.add(row['gt_index'])
+                #mark pred as matched
+                matched_preds.add(row['pred_index'])
+                
+                
+            elif row['pred_index'] in matched_preds:
+                #print(f"--> skipped: Prediction {row['pred_index']} already matched")
+                skip_counter +=1
+            elif row['gt_index'] in matched_gt:
+                #print(f"--> skipped: GT {row['gt_index']} already matched")
+                skip_counter +=1
+        if verbose:
+            print(f"\n Image {image_id} processing complete")
+            print(f"Matches:{match_counter}")
+            print(f"skips: {skip_counter}")
+        
+            
+    #convert list of unique matches to df
+    filtered_df = pd.DataFrame(unique_matches)
+    #sort by pred index
+    filtered_df = filtered_df.sort_values(by=['image_id', 'pred_index'])
+
+    if verbose:
+        print("\nFinal Filtered DataFrame:")
+        print(filtered_df)
+
+    
+    return filtered_df
+
+ 
+def print_verbose(message, verbose_level=1):
+    """Prints the message only if verbose_level is greater than 0."""
+    if verbose_level > 0:
+        print(message)
+    
+    
+def load_model(model_path, model_dict, model_list, model_dir, config):
+    """ Helper function to load models based on paths given in input"""
+    
+    model = modellib.MaskRCNN(mode="inference", 
+                          config=config,
+                          model_dir=model_dir)
+    
+    print(f"Loading model weights from: {model_path}")
+    
+    model.load_weights(model_path, by_name=True)
+    
+    model_name = os.path.basename(os.path.dirname(model_path))
+    
+    model_dict[model_name] = {
+        "model": model,
+        "confidence": config.DETECTION_MIN_CONFIDENCE, 
+        "path": model_path
+        }
+    model_list.append(model_name)
+    print(f"Loaded model: {model_name}")
+    
+    return model
+    
+    
+####Postprocessing additions
+def compute_equi_diam_pix(masks):
+    """Computes the equivalent diameter of particle mask
+    masks: [Height, Width, instances] """
+    
+    if masks.shape[-1] ==0:
+        return np.zeros((masks.shape[-1]))
+    #flatten masks and compute area
+    masks = np.reshape(masks > .5, (-1,masks.shape[-1])).astype(np.float32)
+    area = np.sum(masks, axis=0)
+   
+    dp_pix = np.sqrt((4*area)/np.pi)
+      
+    return dp_pix, area
+
+def filter_mask_size(masks, min_dp_pix = 18):
+    N = masks.shape[-1]
+    if N == 0:
+        return masks
+    # Ensure binary
+    masks = masks > 0.5
+    #compute diameters and areas
+    dp_pix, area = compute_equi_diam_pix(masks)
+    print("Min dp: (pre-filter)", min(dp_pix))
+    keep = np.ones(masks.shape[-1], dtype=bool)
+    keep &= dp_pix >= min_dp_pix
+    
+    #filter
+    filtered_masks = masks [:,:,keep ]
+    dp_pix_filtered = dp_pix[keep]
+    print("Min dp: (filtered):", min(dp_pix_filtered))
+    return filtered_masks
+    
+
+def compute_mask_centroids(masks, scale=None):
+    N = masks.shape[-1]
+    #print("N", N)
+    centroids = []
+    pixel_counts = []
+    
+    for i in range(N):
+        mask = masks[:, :, i]  # Select the i-th mask
+
+        # Get coordinates of all pixels where the mask is True (nonzero)
+        y_coords, x_coords = np.where(mask)
+
+        # Calculate average x and y coordinates (centroid)
+        x_avg = np.mean(x_coords)
+        y_avg = np.mean(y_coords)
+
+        # Count the number of pixels in the mask
+        pixel_count = len(x_coords)
+
+    # Append results
+        centroids.append((x_avg, y_avg))
+        pixel_counts.append(pixel_count)
+    centroids = np.array(centroids)
+    pixel_counts = np.array(pixel_counts)
+
+    return centroids, pixel_counts
+
+def calculate_radius_of_gyration(df_main):
+    df = df_main.copy()
+    
+    #Use particle area as weight
+    weights = df['PP area (nm^2)']
+    
+    #compute weights centroids of aggregate
+    x_centroid = (df['x_avg'] * weights).sum() / weights.sum()
+    y_centroid = (df['y_avg'] * weights).sum() / weights.sum()
+    
+    #Compute square distances of each particle from aggregate centroid
+    df['distance_sq'] = (df['x_avg'] - x_centroid)**2 + (df['y_avg'] - y_centroid)**2
+    
+    #Caluclate weighted mean of squared distances
+    weighted_mean_sq_distance = (weights * df['distance_sq']).sum() / weights.sum()
+
+    #calculate aggregate radius of gyration
+    Rg = np.sqrt(weighted_mean_sq_distance)*df['scale_length (nm)'].mean()
+    
+    return Rg
+
+
+def compute_fractal_dimension(masks, save_binary=True, save_path=None, show=False, plot=0,):
+
+    analyzer = SF.StereoFractAnalyzer()
+
+    binary_mask = 255 - np.any(masks, axis=-1).astype(np.uint8)*255
+    if save_binary:
+        if save_path is None:
+            raise ValueError("save path must be provided")
+        plt.figure(figsize = (binary_mask.shape[1]/100, binary_mask.shape[0]/100),dpi=100)
+        plt.imshow(binary_mask, cmap='gray')
+        plt.axis('off')
+        plt.tight_layout(pad=0.0)
+        plt.savefig(save_path, format="png",bbox_inches='tight', pad_inches=0,orientation= 'landscape')
+        plt.close()
+        plt.tight_layout(pad=0.0)
+
+        if show:
+            plt.imshow(binary_mask, cmap='gray')
+            plt.axis('off')
+            plt.show()
+            
+        image_path = save_path
+    
+    else: 
+        #save as temp image if not saving
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_file:
+            temp_filename = temp_file.name   
+        Image.fromarray(binary_mask).save(temp_filename)
+        image_path = temp_filename
+ 
+    fractal_dimension = analyzer.get_image_fractal_dimension(image_path, plot=plot)
+    
+    if not save_binary:
+        os. remove(temp_filename)
+    
+    return fractal_dimension
+
+
+def process_particles(dataset_name, datasets, model_dict, Results_DIR, model_name=None, 
+                      image_scales=None, verbose = 0, save_binary=False, show_binary_union=False, plot_df=0):
+    dp_pix_all = []
+    dp_nm_all = []
+    records = []
+    fractal_dims = []
+    
+    #load dataset (need to use images even if using model)
+    dataset = datasets.get(dataset_name, None)
+    if dataset is None:
+        raise ValueError(f"Dataset '{dataset_name}' not found.")
+    
+    #run for each image in dataset
+    image_ids = dataset.image_ids
+    #progress_bar = tqdm(image_ids, desc=f"Processing '{dataset_name}' images", dynamic_ncols=True)
+    #progress bar is WIP
+    
+    for image_id in image_ids:
+        image = dataset.load_image(image_id)
+        original_filename = dataset.image_info[image_id]['basename']
+        base_filename = os.path.splitext(os.path.basename(original_filename))[0] 
+        
+        
+        print(f"↳Processing Image {image_id} ({base_filename})")
+        
+
+        #get image scales from either dict or float
+        if isinstance(image_scales,dict):
+            scale = image_scales.get(base_filename)
+            if scale is None:
+                print(f"No Scale found for {base_filename}, skipping")
+        else:
+            scale = image_scales
+        
+       
+        
+        if model_name:
+            model = model_dict[model_name]['model'] #load model
+            confidence = model_dict[model_name]['confidence'] #get conf threshold
+            print(f"Using Model {model_name} (conf_thresh = {confidence})")
+            binary_dir = os.path.join(Results_DIR, dataset_name,'Visualizations', f"{model_name}_{confidence}", 'Binary_Unions' )
+            results = model.detect([image], verbose=0)
+            r = results[0]
+            masks = r['masks']
+                
+        else:
+            print(f"Analyzing Dataset Masks: {dataset_name}")
+            model=None
+            binary_dir = os.path.join(Results_DIR, dataset_name, 'Visualizations', dataset_name,'Binary_Unions' )
+            masks,_ = dataset.load_mask(image_id)
+        
+        #optional: set path for saving binary unions
+        binary_filename = f"{base_filename}_binary.png"  # Name the file based on the original image
+        binary_path = os.path.join(binary_dir, binary_filename)
+        if save_binary:
+            print_verbose(f"{binary_path}", verbose)
+        
+        if dataset_name == 'PROCI_EDMWS':
+            masks = filter_mask_size(masks,min_dp_pix = 18)
+        
+        #compute fractal dimension (once per image)
+        fractal_dim = compute_fractal_dimension(masks, save_binary=save_binary, save_path=binary_dir, show=show_binary_union, plot=plot_df)
+        fractal_dims.append({'image': base_filename, 'fractal dimension': fractal_dim})
+        
+        #compute particle diameters
+        dp_pix, area_pix = compute_equi_diam_pix(masks)
+        
+        #compute centroids and pixel counts
+        centroids, pixel_counts = compute_mask_centroids(masks)
+        
+        
+        
+        for i in range(len(dp_pix)):
+            x_avg, y_avg = centroids[i]
+            pixel_count = pixel_counts[i]
+            dp_nm = dp_pix[i]*scale
+            
+            records.append({
+                "image": base_filename,
+                "scale_length (nm)": scale,
+                "scale_area (nm^2)": scale**2,
+                "PP #": i+1,
+                "dp (pix)": dp_pix[i],
+                "dp (nm)" : dp_nm,
+                "PP area (pix)": area_pix[i],
+                "PP area (nm^2)": 0.25*np.pi*dp_nm**2,
+                "x_avg": x_avg,
+                "y_avg": y_avg,
+                "num_pixels": pixel_count
+                
+            })
+            dp_pix_all.append(dp_pix[i])
+            dp_nm_all.append(dp_nm)
+
+            
+    df =pd.DataFrame(records)
+    df_fd = pd.DataFrame(fractal_dims)
+    
+    return df, df_fd, dp_pix_all, dp_nm_all, 
+
+def gather_aggregate_morphology(ref_set, scales, settings, 
+                               save_binary=False, show_binary=False, plot=False):
+    """wrapper function to gather and save aggregate morphology information"""
+    
+    dataset_name = settings['dataset_name']
+    datasets = settings['datasets']
+    model_dict = settings['model_dict']
+    Results_DIR = settings['Results_DIR']
+    model_name = settings.get('model_name')
+    save_results = settings.get('save_results', 0)
+    verbose = settings.get('verbose', 0)
+    
+    #calculate dp and get mean for each image
+    dataset = datasets.get(dataset_name, None)
+    pp_output_dir = os.path.join(Results_DIR, ref_set, 'PP_Info')
+    os.makedirs(pp_output_dir, exist_ok=True)
+    if model_name:
+        model = model_dict[model_name]['model']
+        confidence = model_dict[model_name]['confidence']
+        method = model_name
+        pp_save_name = os.path.join(pp_output_dir,f"{model_name}_{confidence}_pp_info.csv")
+        #add save path
+    else:
+        model=None
+        method = dataset_name
+        pp_save_name = os.path.join(pp_output_dir, f"{dataset_name}_pp_info.csv")
+    #g -- Process individual particles and fractal dimension
+    
+    #(dataset_name, model_name=None, image_scales=None, save_binary=False, show_binary_union=False, plot_df=0):
+    
+    #Process individual particles (give df with dp info)
+    df_particles, fractal_dims, dp_pix_all, dp_nm_all = process_particles(dataset_name, datasets, model_dict, Results_DIR, model_name, scales, verbose, 
+                                                                          save_binary, show_binary, plot)
+    
+    #print_verbose(f" Fractal Dimension df {fractal_dims}", verbose)
+    #print_verbose(f"", verbose)
+    #print_verbose(f"{df_particles.head(5)}", verbose)
+    
+    particles = df_particles.image.unique()
+    
+    N_pp = []
+    mean_dp_pix = []
+    SEM_mdp_pix = []
+    STD_mdp_pix = []
+    mean_dp_nm = []
+    SEM_mdp_nm = []
+    STD_mdp_nm = []
+    Rg_pix = []
+    Rg_nm = []
+    methods = []
+    scale_list = []
+
+    for i, particle in enumerate(particles):
+        particle_data = df_particles[df_particles['image']==particle].copy()
+        #print(particle_data)
+        scale_length = particle_data['scale_length (nm)'].mean()
+        scale_list.append(scale_length)
+        print_verbose(f"Processing Image: {particle}", verbose)
+        print_verbose(f" ", verbose)
+        
+        # --Primary particle count
+        N = len(particle_data)
+        print_verbose(f"---> # of PP: {N}", verbose) 
+        N_pp.append(N)
+        print_verbose(f" ", verbose)
+        
+        # -- dp statistics (pixels)
+        mdp_pix = particle_data['dp (pix)'].mean()
+        sem_dp_pix = particle_data['dp (pix)'].sem()
+        std_dp_pix =  particle_data['dp (pix)'].std()
+        print_verbose(f"---> Mean dp(pix): {mdp_pix} ||| SEM: {sem_dp_pix} & STD: {std_dp_pix}", verbose)
+        mean_dp_pix.append(mdp_pix)
+        SEM_mdp_pix.append(sem_dp_pix)
+        STD_mdp_pix.append(std_dp_pix)
+        
+        # -- dp statistics (nm)
+        mdp_nm = particle_data['dp (nm)'].mean()
+        sem_dp_nm = particle_data['dp (nm)'].sem()
+        std_dp_nm =  particle_data['dp (nm)'].std()
+        print_verbose(f"---> Mean dp(nm): {mdp_nm} ||| SEM: {sem_dp_nm} & STD: {std_dp_nm}", verbose)
+        mean_dp_nm.append(mdp_nm)
+        SEM_mdp_nm.append(sem_dp_nm)
+        STD_mdp_nm.append(std_dp_nm)
+        
+        
+        # -- Radius of Gyration
+        radius = calculate_radius_of_gyration(particle_data)
+        print_verbose(f"---> Radius of Gyration (nm) for {particle}: {radius}", verbose)
+        Rg_nm.append(radius)
+        print_verbose(f"---> Radius of Gyration (pix) for {particle}: {radius/scale_length}", verbose)
+        Rg_pix.append(radius/scale_length)
+        
+        # -- Fractal Dimension
+        fractal_dim = fractal_dims.iloc[i]['fractal dimension']
+        print_verbose(f"---> Fractal Dimension for {particle}: {fractal_dim}", verbose)
+        print_verbose(f"", verbose)
+        methods.append(method)
+        print(f"--> N: {N} | Mean dp (nm): {mdp_nm:.3f} (SEM: {sem_dp_nm:.3f}, STD: {std_dp_nm}) | Rg (nm): {radius:.3f} | Fractal Dim: {fractal_dim:.3f}")
+        
+        print_verbose(f"", verbose)
+    # --Final Aggregate Summary                  
+    aggregates = pd.DataFrame({'image': particles, 
+                               "method": methods,
+                               "length scale [nm/pix]": scale_list,
+                               "# of PP": N_pp,
+                               "Mean dp [pix]": mean_dp_pix,
+                               "mdp SEM [pix]": SEM_mdp_pix,
+                               "mdp STD [pix]": STD_mdp_pix,
+                               "Mean dp [nm]": mean_dp_nm,
+                               "mdp SEM [nm]": SEM_mdp_nm,
+                               "mdp STD [nm]": STD_mdp_nm,
+                               "Rg [pix]": Rg_pix,
+                               "Rg [nm]": Rg_nm,
+                               "fractal_dim": fractal_dims['fractal dimension'],
+                               
+                              })
+    
+    # -- Create save path based on reference dataset
+    save_dir = os.path.join(Results_DIR, ref_set)
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir,"Aggregate_info.csv")
+    
+    # -- check if file exists to append if it does
+    if save_results:
+        df_particles.to_csv(pp_save_name, index=False)
+        print(f"Saved primary particle info to {pp_save_name}")
+        if os.path.exists(save_path):
+            aggregates.to_csv(save_path, mode='a', header=False, index=False)
+            print(f"Appended aggregate summary to {save_path}")
+        else:
+            aggregates.to_csv(save_path, index=False)
+            print(f"Created new aggregate summary for {ref_set}: {save_path}")
+                          
+    return aggregates, df_particles
+
+
+def calc_performance_metrics(ref_name, inference_config, settings,sort_method='iou'):
+    
+    dataset_name = settings['dataset_name']
+    datasets = settings['datasets']
+    model_dict = settings['model_dict']
+    Results_DIR = settings['Results_DIR']
+    model_name = settings.get('model_name')
+    save_results = settings.get('save_results', 0)
+    verbose = settings.get('verbose', 0)
+    
+    
+    ref_data = datasets.get(ref_name, None)
+    if model_name:
+        model = model_dict[model_name]['model']
+        confidence = model_dict[model_name]['confidence']
+        method = model_name
+        
+        filtered_df = process_matches(model, ref_data, inference_config, sort_method=sort_method,iou_threshold=0, verbose=False)
+        #pp_save_name = os.path.join(pp_output_dir,f"{model_name}_{confidence}_pp_info.csv")
+        #add save path
+    else:
+        model=None
+        method = dataset_name
+        dataset = datasets.get(dataset_name, None)
+        print(f"dataset_name: {dataset_name}, loaded dataset: {dataset}")
+        if dataset_name =='PROCI_EDMWS' or dataset_name == 'PROCI_EDMWS2':
+            filter = True
+        else: 
+            filter = False
+        filtered_df = process_matches(model=None, 
+                                       dataset_analyze=ref_data,
+                                      inference_config=inference_config,
+                                      iou_threshold=0, sort_method=sort_method,
+                                      verbose=False,
+                                      dataset_analyze2=dataset, filter=filter)
+    
+    #print(filtered_df)
+    
+    gt_tot = np.array([])
+    pred_tot = np.array([])
+    mAP_conf = []
+    mAP_iou = []
+    metrics_list = []
+    mAP_ = []
+    AP75_ = []
+    mAP_range_ = []
+    precision_range_ = []
+    recall_range_ = []
+    
+    
+    print_verbose(f"Analyzing {method} performance on {ref_name}", verbose)
+    
+    print_verbose(f"Sorting {method} predictions by {sort_method}", verbose)
+    
+    tp_list = []
+    fp_list = []
+    fn_list = []
+    prec_list = []
+    
+    for image_id in ref_data.image_ids:
+        #get data from reference (ground truth) dataset
+        image, image_meta, gt_class_id, gt_bbox, gt_mask =\
+            modellib.load_image_gt(ref_data, inference_config, image_id)#, use_mini_mask=False)
+        info = ref_data.image_info[image_id]
+        original_filename = ref_data.image_info[image_id]['basename']
+        base_filename = os.path.splitext(os.path.basename(original_filename))[0]
+      
+        
+        tp =0
+        fp=0
+        fn=0
+        
+        if model:
+            results = model.detect([image], verbose=0)
+            r = results[0]
+            
+            print_verbose(f"\n🔍 Processing image {base_filename} (ID: {image_id})", verbose)
+            print_verbose(f"Detected {len(r['class_ids'])} predictions for {base_filename}", verbose)
+            
+            gt, pred = gt_pred_lists(gt_class_id, gt_bbox, r['class_ids'], r['rois'])
+            gt = np.array(gt).astype(int)
+            pred = np.array(pred).astype(int)
+    
+            gt_tot = np.append(gt_tot, gt)
+            pred_tot = np.append(pred_tot, pred)
+            #print("the actual len of the gt vect is : ", len(gt_tot))
+            #print("the actual len of the pred vect is : ", len(pred_tot))
+            print_verbose(f"Ground Truth: {len(gt_class_id)} objects | Predictions: {len(r['class_ids'])} objects", verbose)
+            
+            if sort_method =='confidence':
+                '''calcualates metrics using confidence scores to order and decide matches'''
+                
+                AP_, precision_, recall_, overlap_= compute_ap(gt_bbox, gt_class_id, gt_mask,
+                                          r['rois'], r['class_ids'], r['scores'], r['masks'])
+                mAP_.append(AP_)
+                
+                AP75, _, _, _ = compute_ap(gt_bbox,gt_class_id,gt_mask,r['rois'],
+                                                 r['class_ids'], r['scores'], r['masks'], iou_threshold=0.75)
+                
+                AP75_.append(AP75)
+                mean_ap_ = compute_ap_range(gt_bbox, gt_class_id, gt_mask, 
+                                                                          r['rois'], r['class_ids'], r['scores'], r['masks'])
+                
+                mAP_range_.append(mean_ap_)
+                
+                print_verbose(f"AP (conf sort) for {base_filename}: {AP_}",verbose )
+                print_verbose(f"AP 0.75: {AP75}", verbose)
+                print_verbose(f"", verbose)
+                print_verbose(f"AP(ranged) (conf sort) for {base_filename}: {mean_ap_}",verbose)
+                #print_verbose(f"Precision (conf sort) for {base_filename}: {precision_conf}", verbose)
+                #print_verbose(f"Recall (conf sort) for {base_filename}: {recall_conf}", verbose)
+                
+            if sort_method =='iou':
+                '''use IoU as a 'pseudo score' and sort the same way confidence scores 
+                sorted for use in matching and AP calculations'''
+                overlaps = compute_overlaps_masks(gt_mask, r['masks'])
+                
+                pseudo_scores = np.max(overlaps,axis=0)
+                sorted_ix = np.argsort(pseudo_scores)[::-1]
+                
+                pred_boxes= r['rois'][sorted_ix]
+                pred_class_ids= r['class_ids'][sorted_ix]
+                pseudo_scores = pseudo_scores[sorted_ix]
+                pred_masks = r['masks'][..., sorted_ix]
+                
+                AP_, precision_, recall_, overlap_ = compute_ap(gt_bbox, gt_class_id, gt_mask,
+                                          pred_boxes, pred_class_ids, pseudo_scores, pred_masks)
+                mAP_.append(AP_)
+                AP75, _, _, _= compute_ap(gt_bbox, gt_class_id, gt_mask, pred_boxes, 
+                                            pred_class_ids, pseudo_scores, pred_masks, iou_threshold=0.75)
+                
+                AP75_.append(AP75)
+                mean_ap_  = compute_ap_range(gt_bbox, gt_class_id, gt_mask, 
+                                                                         pred_boxes, pred_class_ids, pseudo_scores, pred_masks)
+                
+                mAP_range_.append(mean_ap_)
+                
+                
+                print_verbose(f"AP (iou sort) for {base_filename}: {AP_}", verbose)
+                print_verbose(f"AP 0.75: {AP75}", verbose)
+                print_verbose(f"AP(ranged) (conf sort) for {base_filename}: {mean_ap_}",verbose)
+                
+                #print_verbose(f"Precision (iou sort) for {base_filename}: {precision_iou}", verbose)
+                #print_verbose(f"Recall (iou sort) for {base_filename}: {recall_iou}", verbose)
+                
+                
+                print_verbose(f"", verbose)
+                
+        else:
+            _,_, data_class_id,data_bbox, data_mask =\
+                modellib.load_image_gt(dataset, inference_config, image_id)#, use_mini_mask=False)
+            print_verbose(f"[Before filtering] {base_filename}: {data_mask.shape[-1]} masks", verbose)
+            if dataset_name == 'PROCI_EDMWS' or dataset_name == 'PROCI_EDMWS2':
+                data_mask = filter_mask_size(data_mask, min_dp_pix = 18)
+                
+            print_verbose(f"[After filtering] {base_filename}: {data_mask.shape[-1]} masks", verbose)
+            print_verbose(f"\n🔍 Processing image {base_filename} (ID: {image_id})", verbose)
+            print_verbose(f"Detected {len(data_class_id)} predictions for {base_filename}", verbose)
+            
+            gt, pred = gt_pred_lists(gt_class_id, gt_bbox, data_class_id, data_bbox)
+            gt = np.array(gt).astype(int)
+            pred = np.array(pred).astype(int)
+
+            gt_tot = np.append(gt_tot, gt)
+            pred_tot = np.append(pred_tot, pred)
+            #print("the actual len of the gt vect is : ", len(gt_tot))
+            #print("the actual len of the pred vect is : ", len(pred_tot))
+            print_verbose(f"Ground Truth: {len(gt_class_id)} objects | Predictions: {len(data_class_id)} objects", verbose)
+                
+            overlaps = compute_overlaps_masks(gt_mask, data_mask)
+                
+            pseudo_scores = np.max(overlaps,axis=0)
+            sorted_ix = np.argsort(pseudo_scores)[::-1]
+                
+            pred_boxes=data_bbox[sorted_ix]
+            pred_class_ids= data_class_id[sorted_ix]
+            pseudo_scores = pseudo_scores[sorted_ix]
+            pred_masks = data_mask[..., sorted_ix]
+                
+            AP_, precision_, recall_, overlap_ = compute_ap(gt_bbox, gt_class_id, gt_mask,
+                                      pred_boxes, pred_class_ids, pseudo_scores, pred_masks)
+            print_verbose(f"{AP_}", verbose)
+            mAP_.append(AP_)
+            
+            AP75, _, _, _= compute_ap(gt_bbox, gt_class_id, gt_mask, pred_boxes, 
+                                            pred_class_ids, pseudo_scores, pred_masks, iou_threshold=0.75)
+                
+            AP75_.append(AP75)
+            
+             
+            mean_ap_ = compute_ap_range(gt_bbox, gt_class_id, gt_mask, 
+                                                                         pred_boxes, pred_class_ids, pseudo_scores, pred_masks)
+                
+            mAP_range_.append(mean_ap_)
+            
+            
+            
+            print_verbose(f"AP (iou sort) for {base_filename}: {AP_}", verbose)
+            print_verbose(f"AP(ranged) (conf sort) for {base_filename}: {mean_ap_}",verbose)
+            
+            print_verbose(f"{mAP_}")
+        #try ap through the df
+        image_df = filtered_df[filtered_df['image_id']==image_id]
+            
+        tp = len(image_df[image_df['iou']>=0.5])
+        fp = len(image_df[image_df['iou']<0.5])
+        gtlen = len(gt_class_id)
+        #print("tot_gt", gtlen)
+            
+        fn = gtlen - tp - fp
+        
+        prec_2 = tp/(tp+fp+fn)
+        print_verbose(f"AP from TP,etc on {base_filename}: {prec_2}", verbose)
+        tp_list.append(tp)
+        fp_list.append(fp) 
+        fn_list.append(fn)
+        prec_list.append(prec_2)
+            
+    print_verbose(f"TP list {tp_list}", verbose)
+    print_verbose(f"FP list {fp_list}", verbose)
+    print_verbose(f"FN list {fn_list}",verbose)
+    
+    tp = np.sum(tp_list)  
+    fp = np.sum(fp_list)  
+    fn = np.sum(fn_list)
+    
+    print(f"CM Values TP: {tp}, FP {fp}, FN: {fn}")
+    #prec_tot = tp_tot/(tp_tot+fp_tot+fn_tot)
+    #print(prec_tot)
+    prec_ave = np.mean(prec_list)
+    #print(prec_ave)        
+    
+                
+    mean_iou = filtered_df['iou'].mean()
+    print("Mean IoU: ",mean_iou)           
+    final_mAP = sum(mAP_)/len(mAP_)    
+    print(f"Final AP_0.5: {final_mAP}")
+    final_AP75 = sum(AP75_)/len(mAP_)
+    print(f"Final AP_0.75: {final_AP75}") 
+    final_mAP_range = sum(mAP_range_)/len(mAP_range_)
+    print(f"Final mAP (ranged): {final_mAP_range}")
+    
+    accuracy = (tp) / (tp+fp+fn)
+    print('Accuracy:', accuracy)
+    precision = tp/(tp+fp)
+    print('Precision:', precision)
+    recall = tp/(tp+fn)
+    print('Recall:', recall)
+    F1 = tp/(tp+0.5*(fp+fn))
+    print('F1 Score:',F1)
+            
+        
+    metrics_dict = {
+    "Method" : method,
+    "Test Dataset": ref_name,
+    "Confidence Threshold": model_dict[model_name]['confidence'] if model else 'N/A',
+    "TP": int(tp),
+    "FP": int(fp),
+    "FN": int(fn),
+    "Accuracy": round(accuracy,4),
+    "Precision": round(precision,4),
+    "Recall": round(recall,4),
+    "F1": round(F1,4),
+    "AP_50":round(final_mAP,4),
+    "AP_75":round(final_AP75,4),
+    "AP_range": round(final_mAP_range,4),
+    "Mean IoU": round(mean_iou,4)
+    }
+    metrics_list.append(metrics_dict)
+    metrics_df = pd.DataFrame(metrics_list)
+
+    print(metrics_df.head(5))
+
+    if save_results:
+        output_path = os.path.join(Results_DIR, "Metrics") if sort_method == 'confidence' else os.path.join(Results_DIR, "Metrics", "IoUSort" )
+        csv_path = os.path.join(output_path, f"{method}_metrics.csv")
+        if os.path.exists(csv_path):
+            print(f"appended to: {csv_path}")
+            metrics_df.to_csv(csv_path, mode='a',header=False, index=False)
+        else:
+            print(f"created at: {csv_path}")
+            metrics_df.to_csv(csv_path, mode='w', header=True, index=False)
+
+            #pp_save_name = os.path.join(pp_output_dir, f"{dataset_name}_pp_info.csv")
+        
+    return metrics_df
+
+def full_summary(aggs_df, metrics_df, pp_df, settings):
+  
+ 
+    Results_DIR = settings['Results_DIR']
+    save_results = settings.get('save_results', 0)
+    verbose = settings.get('verbose', 0)
+    
+    summary_dict = {
+        "Method": metrics_df['Method'].iloc[0],
+        "Conf Thresh": metrics_df['Confidence Threshold'].iloc[0],
+        "TP": metrics_df['TP'].iloc[0],
+        "FP": metrics_df['FP'].iloc[0],
+        "FN": metrics_df['FN'].iloc[0],
+        "Acc.": metrics_df['Accuracy'].iloc[0],
+        "Prec.": metrics_df['Precision'].iloc[0],
+        "Rec.": metrics_df['Recall'].iloc[0],
+        "F1": metrics_df['F1'].iloc[0],
+        "AP50": metrics_df['AP_50'].iloc[0],
+        "AP75": metrics_df['AP_75'].iloc[0],
+        "mAP": metrics_df['AP_range'].iloc[0],
+        "Mean IoU": metrics_df['Mean IoU'].iloc[0],
+        "Mean dF": round(aggs_df['fractal_dim'].mean(),4),
+        "dF SEM": round(aggs_df['fractal_dim'].sem(),4),
+        "df STD": round(aggs_df['fractal_dim'].std(),4),
+        "Mean Rg [nm]": round(aggs_df['Rg [nm]'].mean(),4),
+        "Rg SEM": round(aggs_df['Rg [nm]'].sem(),4),
+        "Rg STD": round(aggs_df['Rg [nm]'].std(),4),
+        "Mean dp [nm]": round( pp_df['dp (nm)'].mean(),4),
+        "dp SEM": round( pp_df['dp (nm)'].sem(),4),
+        "dp STD": round( pp_df['dp (nm)'].std(),4),
+    }
+    if verbose:
+        for k,v in summary_dict.items():
+            print(f"{k}: {v}")
+            
+    summary_df = pd.DataFrame([summary_dict])
+    if save_results:
+        output_dir = os.path.join(Results_DIR,metrics_df['Test Dataset'].iloc[0])
+        #print(output_dir)
+        output_path = os.path.join(output_dir, "Full Summary.csv")
+        if os.path.exists(output_path):
+            print(f"appended to: {output_path}")
+            summary_df.to_csv(output_path, mode='a',header=False, index=False)
+        else:
+            print(f"created at: {output_path}")
+            summary_df.to_csv(output_path, mode='w', header=True, index=False)
+
+            #pp_save_name = os.path.join(pp_output_dir, f"{dataset_name}_pp_info.csv")
+        
+        
+        
+    return summary_df
+                  
+
+####### Confusion matrix ########
 
 #function 1 to be added to your utils.py
 def get_iou(a, b, epsilon=1e-5):
@@ -1028,8 +2237,8 @@ def gt_pred_lists(gt_class_ids, gt_bboxes, pred_class_ids, pred_bboxes, iou_tres
                 
                 #chack if the overlapping objects are from the same class
                 if (gt_class == pred_class):
-                	gt.append(gt_class)
-                	pred.append(pred_class)
+                    gt.append(gt_class)
+                    pred.append(pred_class)
                 #if the overlapping objects are not from the same class 
                 else : 
                     gt.append(gt_class)

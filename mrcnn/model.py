@@ -16,6 +16,7 @@ from collections import OrderedDict
 import multiprocessing
 import numpy as np
 import tensorflow as tf
+import yaml
 import tensorflow.keras as keras
 import tensorflow.keras.backend as K
 import tensorflow.keras.layers as KL
@@ -23,6 +24,7 @@ import tensorflow.keras.utils as KU
 from tensorflow.python.eager import context
 import tensorflow.keras.models as KM
 from tensorflow.keras.callbacks import EarlyStopping
+
 
 from mrcnn import utils
 import sys
@@ -2169,7 +2171,7 @@ class MaskRCNN(object):
         """
         # Optimizer object
         optimizer = keras.optimizers.legacy.SGD(
-            lr=learning_rate, momentum=momentum,
+            learning_rate=learning_rate, momentum=momentum,   #lr=learning_rate
             clipnorm=self.config.GRADIENT_CLIP_NORM)
         # Add Losses
         loss_names = [
@@ -2331,6 +2333,9 @@ class MaskRCNN(object):
             # All layers
             "all": ".*",
         }
+
+        stage_name = layers
+        #print(f"Stage name: {layers}, {stage_name}")
         if layers in layer_regex.keys():
             layers = layer_regex[layers]
 
@@ -2351,20 +2356,30 @@ class MaskRCNN(object):
                           restore_best_weights=self.config.ES_RESTORE_BEST_WEIGHTS,
                           mode=self.config.ES_MODE,
                           verbose = self.config.ES_VERBOSE)
-        
+                          
+       
+
+
         callbacks = [
             keras.callbacks.TensorBoard(log_dir=self.log_dir,
                                         histogram_freq=0, write_graph=True, write_images=False),
             keras.callbacks.ModelCheckpoint(self.checkpoint_path,
                                             verbose=0, save_weights_only=True),
-            early_stopping
+            early_stopping, 
+        
         ]
             
-
+        #self.current_stage_name = stage_name
+        #print('StageNAME:', self.current_stage_name)
+        #self.current_stage_scheduled_epochs = epochs
+        #print('Scheduled epochs', self.current_stage_scheduled_epochs)
+        
         # Add custom callbacks to the list
         if custom_callbacks:
             callbacks += custom_callbacks
 
+     
+        
         # Train
         log("\nStarting at epoch {}. LR={}\n".format(self.epoch, learning_rate))
         log("Checkpoint Path: {}".format(self.checkpoint_path))
@@ -2889,3 +2904,4 @@ def denorm_boxes_graph(boxes, shape):
     scale = tf.concat([h, w, h, w], axis=-1) - tf.constant(1.0)
     shift = tf.constant([0., 0., 1., 1.])
     return tf.cast(tf.round(tf.multiply(boxes, scale) + shift), tf.int32)
+

@@ -15,6 +15,7 @@ import colorsys
 import io
 import cv2
 
+
 import numpy as np
 from skimage.measure import find_contours
 import matplotlib.pyplot as plt
@@ -22,6 +23,9 @@ from matplotlib import patches,  lines
 from matplotlib.patches import Polygon
 from matplotlib.colors import Normalize
 import IPython.display
+import seaborn as sns
+from PIL import Image
+from tqdm import tqdm
 
 
 # Root directory of the project
@@ -31,6 +35,8 @@ ROOT_DIR = os.path.abspath("../")
 sys.path.append(ROOT_DIR)  # To find local version of the library
 from mrcnn import utils
 
+from mrcnn.utils import print_verbose
+import mrcnn.model as modellib
 
 ############################################################
 #  Visualization
@@ -89,7 +95,7 @@ def display_instances(image, boxes, masks, class_ids, class_names,
                       figsize=(16, 16), figAx=None,
                       show_mask=True, show_bbox=True,
                       show_caption=True,
-                      colors=None, captions=None, save_path=None, linewidth=2):
+                      colors=None, captions=None, save_path=None, view=True, linewidth=2):
     """
     boxes: [num_instance, (y1, x1, y2, x2, class_id)] in image coordinates.
     masks: [height, width, num_instances]
@@ -176,142 +182,15 @@ def display_instances(image, boxes, masks, class_ids, class_names,
     
     if save_path is not None:
         plt.savefig(save_path, bbox_inches='tight', pad_inches=0,orientation= 'landscape')
-        plt.close()
-   
-    if auto_show:
-        plt.show()
         
-def display_inst_heat(image, boxes, masks, class_ids, class_names,
-                      scores=None,
-                      metric=None, metric_name="Metric",normalize_metric=False, norm_range=(0.5,1.0),
-                      title="",
-                      figsize=(16, 16), figAx=None,
-                      show_mask=True, show_bbox=True,
-                      show_caption=True, show_cbar=True,
-                      colormap='viridis',cbar_position = [0.85, 0.15, 0.03, 0.7], label_color='black', captions=None, save_path=None):
-    """
-    boxes: [num_instance, (y1, x1, y2, x2, class_id)] in image coordinates.
-    masks: [height, width, num_instances]
-    class_ids: [num_instances]
-    class_names: list of class names of the dataset
-    scores: (optional) confidence scores for each box
-    title: (optional) Figure title
-    show_mask, show_bbox: To show masks and bounding boxes or not
-    figsize: (optional) the size of the image
-    colors: (optional) An array or colors to use with each object
-    captions: (optional) A list of strings to use as captions for each object
-    """
-    """image copy for furthere analysis"""
-    unmaskedimage = image.copy()
-    # Number of instances
-    N = boxes.shape[0]
-    if not N:
-        print("\n*** No instances to display *** \n")
+    if view:
+        if auto_show:
+            plt.show()
+
     else:
-        assert boxes.shape[0] == masks.shape[-1] == class_ids.shape[0]
-
-    # If no axis is passed, create one and automatically call show()
-    auto_show = False
-    if not figAx:
-        fig,ax = plt.subplots(1, figsize=figsize)
-        auto_show = True
-    else:
-        fig,ax = figAx
+        if figAx is None:
+            plt.close(fig)
         
-    if metric is not None:
-        if len(metric) !=N:
-            raise ValueError(f"The lenght of the metric array ({len(metric)}) "
-                             f" must match the number of instances ({N}).")
-        #normalize metric if required:
-        if normalize_metric:
-            norm = Normalize(vmin=norm_range[0], vmax=norm_range[1]) if norm_range is not None else Normalize(vmin=np.min(metric), vmax = np.max(metric))
- 
-        else: 
-            norm = None
-            
-        #apply colormap to metric
-        colormap = plt.get_cmap(colormap)
-        colors = [colormap(norm(value) if norm else value) for value in metric]
-            
-    else: 
-        # Generate random colors
-        colors =  random_colors(N)
-
-    # Show area outside image boundaries.
-    height, width = image.shape[:2]
-    ax.set_ylim(height + 10, -10)
-    ax.set_xlim(-10, width + 10)
-    ax.axis('off')
-    ax.set_title(title)
-    # print("image_size is {}".format(image.shape))
-    masked_image = image.astype(np.uint32).copy()
-    for i in range(N):
-        color = colors[i]
-
-        # Bounding box
-        if not np.any(boxes[i]):
-            # Skip this instance. Has no bbox. Likely lost in image cropping.
-            continue
-        y1, x1, y2, x2 = boxes[i]
-        if show_bbox:
-            p = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=2,
-                                   alpha=0.7, linestyle="dashed",
-                                   edgecolor=color, facecolor='none')
-            ax.add_patch(p)
-
-        # Label
-        if show_caption:
-            if not captions:
-                class_id = class_ids[i]
-                score = metric[i] if metric is not None else None
-                label = class_names[class_id]
-                caption = "{} {:.3f}".format(label, score) if score is not None else label
-            else:
-                caption = captions[i]
-            ax.text(x1, y1 + 8, caption,
-                    color='w', size=11, backgroundcolor="none")
-
-        # Mask
-        mask = masks[:, :, i]
-        if show_mask:
-            masked_image = apply_mask(masked_image, mask, color)
-
-        # Mask Polygon
-        # Pad to ensure proper polygons for masks that touch image edges.
-        padded_mask = np.zeros(
-            (mask.shape[0] + 2, mask.shape[1] + 2), dtype=np.uint8)
-        padded_mask[1:-1, 1:-1] = mask
-        contours = find_contours(padded_mask, 0.5)
-        for verts in contours:
-            # Subtract the padding and flip (y, x) to (x, y)
-            verts = np.fliplr(verts) - 1
-            p = Polygon(verts, facecolor="none", edgecolor=color)
-            ax.add_patch(p)
-    ax.imshow(masked_image.astype(np.uint8))
-    
-    #display colorbar
-    if metric is not None and show_cbar:
-        sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
-        sm.set_array([])
-        cbar_ax = fig.add_axes(cbar_position)
-        cbar = fig.colorbar(sm,cax=cbar_ax, orientation='horizontal', label=metric_name, fraction=0.02, pad=0.04)
-         # Adjust the position and size of the colorbar to fit in the image without padding
-        
-        cbar.ax.tick_params(labelsize=16, labelcolor=label_color)
-        cbar.set_label(metric_name,color=label_color,fontsize=20)
-        
-        #fig.subplots_adjust(right=0.96)
-        #cbar.ax.set_position(cbar_position)  # Adjust these values to fit the image better
-    
-    
-    if save_path is not None:
-        plt.tight_layout(pad=0.0)
-        plt.savefig(save_path, bbox_inches='tight', pad_inches=0,orientation= 'landscape')
-        plt.close()
-    plt.tight_layout(pad=0.0)
-
-    if auto_show:
-        plt.show()
 
 def display_differences(image,
                         gt_box, gt_class_id, gt_mask,
@@ -652,6 +531,8 @@ def display_weight_stats(model):
                 "{:+9.4f}".format(w.std()),
             ])
     display_table(table)
+
+############ SAGE Visualizations Added ###############    
     
 def pad_bbox(dataset, model, output_folder, inference_config, class_name="cluster", min_confidence = 0.5,
              image_ids=None, override_class_names=True, save_as_images=True, 
@@ -774,6 +655,423 @@ def pad_bbox(dataset, model, output_folder, inference_config, class_name="cluste
         return start_index
         
                 
-          
+def plot_rev_cum_iou(methods, model_dict, dataset_dict, ref_dataset,config,   save_dir = None, 
+                     iou_threshold=0, iou_summary=False, method_styles=None, fill=True, title=False, verbose=False,):
+    """Processes matches for multiple models, prints IoUs summaries, and plots the reverse cumulative IoU dist
+    Args:
+    models (dict): dictionary where keys are model names 
+    dataset : dataset to analyze
+    config: 
+    save_dir (str): directory to save plot
+    iou_threshold (float): IoU threhold for processing matches
+    verbose (bool): verbosity flag for match processing
+    iou_summary (bool): prints iou summary for each model if True
+    """
+    
+    #dict to store IoU Dfs
+    all_ious = {}
+    
+    
+    ref_data = dataset_dict.get(ref_dataset, None)
+    #process each model and print IoU summary and store results
+    for method in methods:
+        if method in model_dict:
+            model_info = model_dict.get(method)
+            model = model_info.get('model')
+            confidence = model_info.get('confidence')
+            print(f"Using Model: {method}")
+            filtered_df = utils.process_matches(model, ref_data, config,sort_method="confidence",
+                                           iou_threshold=iou_threshold, 
+                                           dataset_analyze2 = None, verbose=verbose, filter=False)
+            all_ious[method] = filtered_df
+    
+        elif method in dataset_dict:
+            model=None
+            dataset = dataset_dict.get(method, None)
+            print(f"Using Dataset: {method}")
+            if method == 'PROCI_EDMWS':
+                filter = True
+            else:
+                filter = False
                 
+            filtered_df = utils.process_matches(model, ref_data, config, sort_method="iou",
+                                          iou_threshold=iou_threshold, dataset_analyze2=dataset, filter=filter)
+            all_ious[method] = filtered_df
+            
+                
+        else:
+            
+            print(f"Method {method} not found in models or datasets")
+        if iou_summary:
+                utils.print_iou_summary(filtered_df, method)
+            
+        if verbose:
+            print(f"{method} - Filtered Df shape: {filtered_df.shape}")   
+                
+            
+            
+            
+    
         
+    #plotting
+    sns.set(style="whitegrid")
+    plt.figure(figsize=(12,8))
+
+
+    #default styles if none are passed
+    if method_styles is None:
+        colors = sns.color_palette("tab10", len(methods))
+        method_styles = {
+            method: {"label": method, "color": colors[i]} for i, method in enumerate(methods)
+        }
+    
+    #loop through each model to plot ecdf and fill area
+    for (method_name, method_ious) in all_ious.items():
+        style = method_styles.get(method_name, {})
+        label = style.get('label', method_name)
+        color = style.get('color', None)
+
+        method_ious['method']=method_name
+        sns.ecdfplot(data=method_ious,
+                    x='iou',
+                    hue='method',
+                    label=label,
+                    stat='count',
+                    complementary=True,
+                    palette=[color] if color else None)
+        if fill:
+            #calculate sorted iou values and cumulative counts for filling
+            sorted_iou = np.sort(method_ious['iou'])[::-1]
+            cum_count=np.arange(1,len(sorted_iou)+1)
+            #fill area under ecdf curve with approriate color
+            
+            plt.fill_between(sorted_iou, 
+                             cum_count, 
+                             color=color if color else 'gray',
+                             alpha=0.5)
+            
+    #add titles and labels
+    if title:
+        plt.title('Reverse Cumulative IoU Distribution',fontsize='29', weight='bold')
+    plt.xlabel('IoU Threshold',fontsize='29')
+    plt.ylabel('# of predictions above IoU',fontsize='29')
+    
+    plt.tick_params(axis='both', which='both', direction='inout', 
+                    length=6, labelsize=25)
+    plt.xticks(np.arange(0, 1.1, 0.1), fontsize=20)
+    #add vertical line at iou=0.5
+    plt.axvline(x=0.5, color= 'black', linestyle='--', label='IoU=0.5')
+    
+    plt.legend(loc='best', fontsize=25)
+    
+    plt.tight_layout
+    
+    method_names = "_".join(all_ious.keys())
+    
+   
+    if save_dir:
+        #create save dir if not exists
+        os.makedirs(save_dir, exist_ok=True)
+        savename = os.path.join(save_dir, f'IoU_dist_{method_names}_{iou_threshold}.png')
+        plt.savefig(savename, dpi=300, bbox_inches='tight')
+        
+    plt.show()          
+                
+def display_inst_heat(image, boxes, masks, class_ids, class_names,
+                      scores=None,
+                      metric=None, metric_name="Metric",normalize_metric=False, norm_range=(0.5,1.0),
+                      title="",
+                      figsize=(16, 16), figAx=None,
+                      show_mask=True, show_bbox=True,
+                      show_caption=True, show_cbar=True,
+                      colormap='viridis',
+                      cbar_position = [0.85, 0.15, 0.03, 0.7], label_color='black', 
+                      captions=None, save_path=None,
+                      show_pred_idx = False,
+                     unmatched_color = (30 / 255, 144 / 255, 1.0)  ):
+    """
+    boxes: [num_instance, (y1, x1, y2, x2, class_id)] in image coordinates.
+    masks: [height, width, num_instances]
+    class_ids: [num_instances]
+    class_names: list of class names of the dataset
+    scores: (optional) confidence scores for each box
+    title: (optional) Figure title
+    show_mask, show_bbox: To show masks and bounding boxes or not
+    figsize: (optional) the size of the image
+    colors: (optional) An array or colors to use with each object
+    captions: (optional) A list of strings to use as captions for each object
+    """
+    """image copy for furthere analysis"""
+    unmaskedimage = image.copy()
+    # Number of instances
+    N = boxes.shape[0]
+    if not N:
+        print("\n*** No instances to display *** \n")
+    else:
+        assert boxes.shape[0] == masks.shape[-1] == class_ids.shape[0]
+
+    # If no axis is passed, create one and automatically call show()
+    auto_show = False
+    if not figAx:
+        fig,ax = plt.subplots(1, figsize=figsize)
+        auto_show = True
+    else:
+        fig,ax = figAx
+    
+    colormap_func = plt.get_cmap(colormap)
+    norm = None
+    #if metric is not None:
+    if metric is not None and normalize_metric:
+        #if len(metric) !=N:
+         #   raise ValueError(f"The lenght of the metric array ({len(metric)}) "
+          #                   f" must match the number of instances ({N}).")
+        
+        if norm_range is not None:
+            norm = Normalize(vmin=norm_range[0], vmax=norm_range[1])
+        else:
+            norm = Normalize(vmin=np.min(metric), vmax=np.max(metric))
+
+        #normalize metric if required:
+       # if normalize_metric:
+            #norm = Normalize(vmin=norm_range[0], vmax=norm_range[1]) if norm_range is not None else Normalize(vmin=np.min(metric), vmax = np.max(metric))
+ 
+        #else: 
+            #norm = None
+            
+        #apply colormap to metric
+        #colormap = plt.get_cmap(colormap)
+        #colors = [colormap(norm(value) if norm else value) for value in metric]
+    colors = []
+    
+    for i in range(N):
+        if metric is not None and i < len(metric) and metric[i] is not None and not np.isnan(metric[i]):
+            value = metric[i]
+            colors.append(colormap_func(norm(value) if norm else value))
+        else:
+            colors.append(unmatched_color)
+    
+
+    # Show area outside image boundaries.
+    height, width = image.shape[:2]
+    ax.set_ylim(height + 10, -10)
+    ax.set_xlim(-10, width + 10)
+    ax.axis('off')
+    ax.set_title(title)
+    # print("image_size is {}".format(image.shape))
+    masked_image = image.astype(np.uint32).copy()
+    for i in range(N):
+        color = colors[i]
+
+        # Bounding box
+        if not np.any(boxes[i]):
+            # Skip this instance. Has no bbox. Likely lost in image cropping.
+            continue
+        y1, x1, y2, x2 = boxes[i]
+        
+        has_metric = metric is not None and i< len(metric) and metric[i] is not None
+        if show_bbox:
+            p = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=2,
+                                   alpha=0.7, linestyle="dashed",
+                                   edgecolor=color, facecolor='none')
+            ax.add_patch(p)
+
+        # Label
+        if show_caption:
+            if not captions:
+                class_id = class_ids[i]
+                score = metric[i] if metric is not None else None
+                label = class_names[class_id]
+                caption = "{} {:.3f}".format(label, score) if score is not None else label
+            else:
+                caption = captions[i]
+            ax.text(x1, y1 + 8, caption,
+                    color='w', size=11, backgroundcolor="none")
+
+        # Mask
+        mask = masks[:, :, i]
+        if show_mask:
+            masked_image = apply_mask(masked_image, mask, color)
+            
+            if show_pred_idx:
+                y_indices, x_indices = np.where(mask)
+                if len(x_indices) > 0 and len(y_indices) > 0:
+                    center_x = int(np.mean(x_indices))
+                    center_y = int(np.mean(y_indices))
+                    ax.text(center_x, center_y, str(i), color=label_color,
+                        fontsize=8, ha='center', va='center',
+                        bbox=dict(facecolor='white', alpha=1, edgecolor='none', boxstyle='round,pad=0.3'))
+        # Mask Polygon
+        # Pad to ensure proper polygons for masks that touch image edges.
+        padded_mask = np.zeros(
+            (mask.shape[0] + 2, mask.shape[1] + 2), dtype=np.uint8)
+        padded_mask[1:-1, 1:-1] = mask
+        contours = find_contours(padded_mask, 0.5)
+        for verts in contours:
+            # Subtract the padding and flip (y, x) to (x, y)
+            verts = np.fliplr(verts) - 1
+            p = Polygon(verts, facecolor="none", edgecolor=color)
+            ax.add_patch(p)
+    ax.imshow(masked_image.astype(np.uint8))
+    
+    #display colorbar
+    if metric is not None and show_cbar:
+        sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
+        sm.set_array([])
+        cbar_ax = fig.add_axes(cbar_position)
+        cbar = fig.colorbar(sm,cax=cbar_ax, orientation='horizontal', label=metric_name, fraction=0.02, pad=0.04)
+         # Adjust the position and size of the colorbar to fit in the image without padding
+        
+        cbar.ax.tick_params(labelsize=16, labelcolor=label_color)
+        cbar.set_label(metric_name,color=label_color,fontsize=20)
+        
+        #fig.subplots_adjust(right=0.96)
+        #cbar.ax.set_position(cbar_position)  # Adjust these values to fit the image better
+    
+    
+    if save_path is not None:
+        plt.tight_layout(pad=0.0)
+        plt.savefig(save_path, bbox_inches='tight', pad_inches=0,orientation= 'landscape')
+        plt.close()
+    plt.tight_layout(pad=0.0)
+
+    if auto_show:
+        plt.show()        
+        
+        
+def get_filtered_df(method_name, ref_name, model_dict, datasets, config, filter_size=False, verbose=0):
+    
+    #load reference data (i.e. ground truth to check against)
+    ref_data = datasets.get(ref_name, None)
+    if ref_data is None:
+        raise ValueError(f"Reference dataset '{ref_name}' not found.")
+        
+    if method_name in model_dict:
+        model_info = model_dict.get(method_name)
+        model = model_info.get('model')
+        confidence = model_info.get('confidence')
+        print_verbose(f"Using Model: {method_name}", verbose)
+        filtered_df = utils.process_matches(model, ref_data, config,sort_method="confidence",
+                                    iou_threshold=0, 
+                                    dataset_analyze2 = None, verbose=0, filter=False)
+        full_name = f"{method_name}_{confidence}"
+        return filtered_df, full_name, model, None, ref_data
+    
+    elif method_name in datasets:
+        model = None
+        dataset = datasets.get(method_name, None)
+        print_verbose(f"Using dataset: {method_name}", verbose)
+        filtered_df = utils.process_matches(model, ref_data, config, sort_method="iou",
+                                        iou_threshold=0, dataset_analyze2=dataset, filter=filter_size, verbose=verbose)
+        full_name = f"{method_name}"
+        return filtered_df, full_name, None,dataset, ref_data
+    
+    else:
+        raise ValueError(f"'{method_name}' not found in models or datasets.")
+        
+
+def get_iou_heatmaps(filtered_df, ref_data, config, model=None, dataset=None,
+                     method_name = "", ref_name = "", Results_DIR=None, verbose=False, save_images = False, vis_settings=None):
+
+    if verbose: 
+        utils.print_iou_summary(filtered_df, method_name)
+        
+    #create vis dir
+    vis_dir = os.path.join(Results_DIR, ref_name, "Visualizations", f"{method_name}","IoU_Heatmaps")
+    os.makedirs(vis_dir, exist_ok=True)
+    #maybe change
+    #filtered_iou_values_new = filtered_df.to_dict(orient='records')
+    
+    average_ious = []
+    
+    image_ids=ref_data.image_ids
+    for image_id in image_ids:
+        image = ref_data.load_image(image_id)
+        
+        #maybe change
+        #ious_for_image = [item for item in filtered_iou_values_new if item['image_id'] == ref_data.image_info[image_id]['id']]
+        
+        original_filename = ref_data.image_info[image_id]['basename']
+        base_filename = os.path.splitext(os.path.basename(original_filename))[0] 
+        print(f"Image ID: {image_id}, File Path: {base_filename}")
+        
+        iou_df = filtered_df[filtered_df['image_id']==image_id]
+        
+        if verbose:
+            print(f"filtered dataframe for Image ID {image_id}")
+            print(iou_df)
+            
+        if model:
+            results = model.detect([image], verbose=1)
+
+            r = results[0]
+            scores = r['scores']
+            print_verbose(("SCORES:",r['scores']),verbose)
+            rois, masks, class_ids = r['rois'], r['masks'], r['class_ids']
+            
+        elif dataset:
+             _,_, class_ids,rois, _ =\
+                    modellib.load_image_gt(dataset, config, image_id)#, use_mini_mask=False)
+    
+             masks, _ = dataset.load_mask(image_id)   
+        
+        else:
+            raise ValueError("Either model or dataset must be provided")
+            
+                      
+        ious_for_image_values = np.full(len(class_ids), np.nan, dtype=np.float32)
+        #ious_for_image_values = np.zeros(len(class_ids))  
+        
+        for pred_idx in range(len(class_ids)):
+            iou_row = iou_df[iou_df['pred_index'] == pred_idx]
+            if not iou_row.empty:
+                ious_for_image_values[pred_idx] = iou_row['iou'].values[0]
+                
+        print_verbose(f"IoUs: {ious_for_image_values}", verbose)
+        
+        average_iou =  np.nanmean(ious_for_image_values)
+        average_ious.append(average_iou)
+        
+        iou_gt_05 = np.sum(ious_for_image_values > 0.5)
+        iou_lt_or_nan = np.sum((ious_for_image_values <= 0.5) | np.isnan(ious_for_image_values))  # Count of IoUs <= 0.5 or NaN
+        
+        
+        print(f"Average IoU (ignoring NaNs): {average_iou}")
+        print(f"Count of IoUs > 0.5: {iou_gt_05}")
+        print(f"Count of IoUs <= 0.5 or NaN: {iou_lt_or_nan}")
+        print("mean Average IoU of this set:", np.mean(average_ious))
+        
+        if save_images:
+        
+            heatmap_filename = f"{base_filename}_heatmap.png"
+            heatmap_path = os.path.join(vis_dir, heatmap_filename)
+            print(f"Heatmap path: {heatmap_path}")
+        else:
+            heatmap_path = None
+            
+            
+        default_vis_settings = dict(
+             metric_name="IoU",
+            normalize_metric=False,
+            show_caption=False,
+            show_bbox=False,
+            show_mask=True,
+            show_cbar=False,
+            colormap='RdYlGn',
+            cbar_position=[0.1, 0.1, 0.8, 0.05],
+            label_color='black',
+            show_pred_idx=False,
+            unmatched_color=(1.0, 105/255.0, 180/255.0)
+            
+            )
+    
+        if vis_settings is not None:
+            default_vis_settings.update(vis_settings)
+
+            
+        display_inst_heat(image, rois, masks, class_ids, ref_data.class_names, 
+                           metric=ious_for_image_values, 
+                           save_path = heatmap_path,
+                           **default_vis_settings
+                          )
+                           
+                         
