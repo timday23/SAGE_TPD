@@ -26,6 +26,8 @@ import tensorflow.keras.models as KM
 from tensorflow.keras.callbacks import EarlyStopping
 
 
+from mrcnn.custom_losses import fisher_loss, equip_loss, PPLossLayerV3, BBoxCoverageVisualizer
+
 from mrcnn import utils
 import sys
 from mrcnn.parallel_model import ParallelModel
@@ -41,6 +43,7 @@ from distutils.version import LooseVersion
 assert LooseVersion(tf.__version__) >= LooseVersion("2.0")
 
 tf.compat.v1.disable_eager_execution()
+tf.compat.v1.experimental.output_all_intermediates(True)
 
 ############################################################
 #  Utility Functions
@@ -1047,6 +1050,221 @@ def build_fpn_mask_graph(rois, feature_maps, image_meta,
     return x
 
 
+
+def build_pp_head(rois, feature_maps, image_meta,
+                         pool_size, num_classes, cluster_masks=None, max_clusters=1, 
+                         train_bn=True, name = "pp_mask_head"):
+    """Builds a primary particle (pp)m mask head similar to the standard Mask R-CNN mask head
+
+    Optionally uses cluster masks as additional input channels,
+    making it 'cluster-aware' so predictions consider spatial significance of aggregate in relation to PPs
+
+    """
+    # ROI Pooling
+    # Shape: [batch, num_rois, MASK_POOL_SIZE, MASK_POOL_SIZE, channels]
+    x = PyramidROIAlign([pool_size, pool_size],
+                        name=f"{name}_roi_align")([rois, image_meta] + feature_maps)
+
+    # x: [B, R, H, W, C]
+
+    #print(rois.shape, image_meta.shape, cluster_masks.shape)
+    
+
+    # optional cluster context injection
+    if cluster_masks is not None:
+        #resize cluster masks to roi pooled resolution
+        #cluster_masks: [B, H_img, W_img, 1]
+        cluster_context = KL.Lambda(
+            lambda t: tf.image.resize(t, (pool_size,pool_size)),
+            name = "pp_cluster_resize"
+        )(cluster_masks)
+
+        #expand across rois
+        cluster_context = KL.Lambda(
+            lambda t: tf.expand_dims(t, axis=1),
+            name= "pp_cluster_expand"
+        )(cluster_context)
+
+        #tile across rois
+        cluster_context = KL.Lambda(
+            lambda t: tf.tile(t, [1, tf.shape(x)[1],1,1,1]),
+            name = "pp_cluster_tile"
+        )(cluster_context)
+
+        #concatenate at geature leavel
+        x = KL.Concatenate(axis=-1, name="pp_cluster_concat")([x, cluster_context])
+
+
+
+    # Conv layers
+    x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                           name=f"{name}_conv1")(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name=f'{name}_bn1')(x, training=train_bn)
+    x = KL.Activation('relu')(x)
+
+    x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                           name=f"{name}_conv2")(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name=f'{name}_bn2')(x, training=train_bn)
+    x = KL.Activation('relu')(x)
+
+    x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                           name=f"{name}_conv3")(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name=f'{name}_bn3')(x, training=train_bn)
+    x = KL.Activation('relu')(x)
+
+    x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                           name=f"{name}_conv4")(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name=f'{name}_bn4')(x, training=train_bn)
+    x = KL.Activation('relu')(x)
+
+    #upsample and output masks
+    x = KL.TimeDistributed(KL.Conv2DTranspose(256, (2, 2), strides=2, activation="relu"),
+                           name=f"{name}_deconv")(x)
+    
+    pp_mask_class = KL.TimeDistributed(
+        KL.Conv2D(num_classes, (1,1), activation="sigmoid"),
+        name="pp_mask_class"
+    )(x)
+
+    pp_mask_single = KL.Lambda(
+        lambda t: tf.reduce_max(t, axis=-1, keepdims=True),
+        name="pp_mask_single"
+    )(pp_mask_class)
+
+    return pp_mask_class, pp_mask_single
+
+
+def build_pp_head_light(rois, feature_maps, image_meta,
+                         pool_size, num_classes, cluster_masks=None, max_clusters=1, 
+                         train_bn=True, name = "pp_mask_head"):
+    """Builds a primary particle (pp)m mask head similar to the standard Mask R-CNN mask head
+
+    Optionally uses cluster masks as additional input channels,
+    making it 'cluster-aware' so predictions consider spatial significance of aggregate in relation to PPs
+
+    """
+    # ROI Pooling
+    # Shape: [batch, num_rois, MASK_POOL_SIZE, MASK_POOL_SIZE, channels]
+    x = PyramidROIAlign([pool_size, pool_size],
+                        name=f"{name}_roi_align")([rois, image_meta] + feature_maps)
+
+    # x: [B, R, H, W, C]
+
+    #print(rois.shape, image_meta.shape, cluster_masks.shape)
+    
+
+    # optional cluster context injection
+    if cluster_masks is not None:
+        #resize cluster masks to roi pooled resolution
+        #cluster_masks: [B, H_img, W_img, 1]
+        cluster_context = KL.Lambda(
+            lambda t: tf.image.resize(t, (pool_size,pool_size)),
+            name = "pp_cluster_resize"
+        )(cluster_masks)
+
+        #expand across rois
+        cluster_context = KL.Lambda(
+            lambda t: tf.expand_dims(t, axis=1),
+            name= "pp_cluster_expand"
+        )(cluster_context)
+
+        #tile across rois
+        cluster_context = KL.Lambda(
+            lambda t: tf.tile(t, [1, tf.shape(x)[1],1,1,1]),
+            name = "pp_cluster_tile"
+        )(cluster_context)
+
+        #concatenate at geature leavel
+        x = KL.Concatenate(axis=-1, name="pp_cluster_concat")([x, cluster_context])
+
+
+
+    # Conv layers
+    x = KL.TimeDistributed(KL.Conv2D(128, (3, 3), padding="same"),
+                           name=f"{name}_conv1")(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name=f'{name}_bn1')(x, training=train_bn)
+    x = KL.Activation('relu')(x)
+
+    x = KL.TimeDistributed(KL.Conv2D(128, (3, 3), padding="same"),
+                           name=f"{name}_conv2")(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name=f'{name}_bn2')(x, training=train_bn)
+    x = KL.Activation('relu')(x)
+
+    x = KL.TimeDistributed(KL.Conv2D(128, (3, 3), padding="same"),
+                           name=f"{name}_conv3")(x)
+    # x = KL.TimeDistributed(BatchNorm(),
+    #                        name=f'{name}_bn3')(x, training=train_bn)
+    # x = KL.Activation('relu')(x)
+
+    # x = KL.TimeDistributed(KL.Conv2D(128, (3, 3), padding="same"),
+    #                        name=f"{name}_conv4")(x)
+    # x = KL.TimeDistributed(BatchNorm(),
+    #                        name=f'{name}_bn4')(x, training=train_bn)
+    # x = KL.Activation('relu')(x)
+
+    #upsample and output masks
+    x = KL.TimeDistributed(KL.Conv2DTranspose(128, (2, 2), strides=2, activation="relu"),
+                           name=f"{name}_deconv")(x)
+    
+    pp_mask_class = KL.TimeDistributed(
+        KL.Conv2D(num_classes, (1,1), activation="sigmoid"),
+        name="pp_mask_class"
+    )(x)
+
+    pp_mask_single = KL.Lambda(
+        lambda t: tf.reduce_max(t, axis=-1, keepdims=True),
+        name="pp_mask_single"
+    )(pp_mask_class)
+
+    return pp_mask_class, pp_mask_single
+
+
+def add_proxy_head(rois, feature_maps, image_meta, 
+                   pool_size=7, proxy_dim=128, num_classes=2, train_bn=True):
+    
+    
+    #1. ROI pooling
+    #Shape[batch, num_rois, POOL_SIZE,channes ]
+    x = PyramidROIAlign([pool_size, pool_size],
+                             name="roi_align_proxy")([rois, image_meta] + feature_maps)
+    
+    #2. Two conv layers (similar to classifier head)
+    x = KL.TimeDistributed(KL.Conv2D(256, (3,3), padding='same'),
+                           name = 'proxy_conv1')(x)
+    
+    x = KL.TimeDistributed(BatchNorm(),
+                           name = "proxy_bn1")(x, training=train_bn)
+    
+    x = KL.Activation('relu')(x)
+
+    x = KL.TimeDistributed(KL.Conv2D(256, (3,3), padding='same'),
+                           name= 'proxy_conv2')(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name = 'proxy_bn2')(x, training=train_bn)
+    
+    #3. Global average pooling to collapse spatial dims
+    x = KL.TimeDistributed(KL.GlobalAveragePooling2D(), name='proxy_gap')(x)
+
+    #4. Dense layer to get proxy features
+    proxy_feats = KL.TimeDistributed(KL.Dense(proxy_dim, activation='linear'),
+                                     name = 'proxy_fc')(x)
+    
+    #transform to on ot class label
+    proxy_feats_class = KL.TimeDistributed(KL.Dense(num_classes, activation='linear'),
+                                           name='proxy_fc_class')(proxy_feats)
+    
+    proxy_feats_bbox = KL.TimeDistributed(KL.Dense(4, activation='linear'),
+                                          name = 'proxy_fc_bbox')(proxy_feats)
+    
+
+    return proxy_feats, proxy_feats_class, proxy_feats_bbox
+
 ############################################################
 #  Loss Functions
 ############################################################
@@ -1159,21 +1377,22 @@ def mrcnn_bbox_loss_graph(target_bbox, target_class_ids, pred_bbox):
     pred_bbox: [batch, num_rois, num_classes, (dy, dx, log(dh), log(dw))]
     """
     # Reshape to merge batch and roi dimensions for simplicity.
-    target_class_ids = K.reshape(target_class_ids, (-1,))
-    target_bbox = K.reshape(target_bbox, (-1, 4))
-    pred_bbox = K.reshape(pred_bbox, (-1, K.int_shape(pred_bbox)[2], 4))
+    #Flatten batch and ROI dimensions
+    target_class_ids = K.reshape(target_class_ids, (-1,)) # [B*R=N] (all rois across batch in 1D)
+    target_bbox = K.reshape(target_bbox, (-1, 4)) # [N,4] (flatten batch & ROIs, keep bbox coords)
+    pred_bbox = K.reshape(pred_bbox, (-1, K.int_shape(pred_bbox)[2], 4)) #[N,C,4] (flattened batch*roi, classes, bbox coords)
 
     # Only positive ROIs contribute to the loss. And only
     # the right class_id of each ROI. Get their indices.
-    positive_roi_ix = tf.compat.v1.where(target_class_ids > 0)[:, 0]
+    positive_roi_ix = tf.compat.v1.where(target_class_ids > 0)[:, 0] #[num_pos] (indices of positive ROIS in flattened array)
     positive_roi_class_ids = tf.cast(
-        tf.gather(target_class_ids, positive_roi_ix), tf.int64)
-    indices = tf.stack([positive_roi_ix, positive_roi_class_ids], axis=1)
+        tf.gather(target_class_ids, positive_roi_ix), tf.int64) #[num_pos] (class IDs corresponding to positive ROIs)
+    indices = tf.stack([positive_roi_ix, positive_roi_class_ids], axis=1) #[num_pos,2] (pairs of [ROI_index, class_id] for indexing pred_bbox)
+
 
     # Gather the deltas (predicted and true) that contribute to loss
-    target_bbox = tf.gather(target_bbox, positive_roi_ix)
-    pred_bbox = tf.gather_nd(pred_bbox, indices)
-
+    target_bbox = tf.gather(target_bbox, positive_roi_ix) #[num_pos, 4] (only positive ROIs kept)
+    pred_bbox = tf.gather_nd(pred_bbox, indices) #[num_pos,4] (predicted bbox deltas for positive rois and class)
     # Smooth-L1 Loss
     loss = K.switch(tf.size(input=target_bbox) > 0,
                     smooth_l1_loss(y_true=target_bbox, y_pred=pred_bbox),
@@ -1192,25 +1411,25 @@ def mrcnn_mask_loss_graph(target_masks, target_class_ids, pred_masks):
                 with values from 0 to 1.
     """
     # Reshape for simplicity. Merge first two dimensions into one.
-    target_class_ids = K.reshape(target_class_ids, (-1,))
-    mask_shape = tf.shape(input=target_masks)
-    target_masks = K.reshape(target_masks, (-1, mask_shape[2], mask_shape[3]))
-    pred_shape = tf.shape(input=pred_masks)
+    target_class_ids = K.reshape(target_class_ids, (-1,)) #flatten batch x ROI: [B,R] -> [B*R=N]
+    mask_shape = tf.shape(input=target_masks) #get shapes of target masks: [B,R,H,W]
+    target_masks = K.reshape(target_masks, (-1, mask_shape[2], mask_shape[3])) #flatten Batch X ROI: [N,H,W]
+    pred_shape = tf.shape(input=pred_masks) #get shapes of pred masks [B,R,H,W,C]
     pred_masks = K.reshape(pred_masks,
-                           (-1, pred_shape[2], pred_shape[3], pred_shape[4]))
+                           (-1, pred_shape[2], pred_shape[3], pred_shape[4])) #flatten: [N, H, W, C]
     # Permute predicted masks to [N, num_classes, height, width]
     pred_masks = tf.transpose(a=pred_masks, perm=[0, 3, 1, 2])
 
     # Only positive ROIs contribute to the loss. And only
     # the class specific mask of each ROI.
-    positive_ix = tf.compat.v1.where(target_class_ids > 0)[:, 0]
+    positive_ix = tf.compat.v1.where(target_class_ids > 0)[:, 0] #removes padding ROIs and BG ROIs (bad ones) [N_pos]
     positive_class_ids = tf.cast(
-        tf.gather(target_class_ids, positive_ix), tf.int64)
-    indices = tf.stack([positive_ix, positive_class_ids], axis=1)
+        tf.gather(target_class_ids, positive_ix), tf.int64) #[N_pos] each entry is class ID for positive ROI
+    indices = tf.stack([positive_ix, positive_class_ids], axis=1) #[N_pos, 2], each row is [roi_index, class_index] used to index pred_masks[N,C,H,W]
 
     # Gather the masks (predicted and true) that contribute to loss
-    y_true = tf.gather(target_masks, positive_ix)
-    y_pred = tf.gather_nd(pred_masks, indices)
+    y_true = tf.gather(target_masks, positive_ix) #[N_pos, H, W] only GT masks for positive ROIs
+    y_pred = tf.gather_nd(pred_masks, indices) # [N_pos, H, W] selects ROI i, for class specific channel, and drops class dimension
 
     # Compute binary cross entropy. If no positive ROIs, then return 0.
     # shape: [batch, roi, num_classes]
@@ -1219,6 +1438,7 @@ def mrcnn_mask_loss_graph(target_masks, target_class_ids, pred_masks):
                     tf.constant(0.0))
     loss = K.mean(loss)
     return loss
+
 
 
 ############################################################
@@ -1456,14 +1676,14 @@ def build_detection_targets(rpn_rois, gt_class_ids, gt_boxes, gt_masks, config):
             gt_h = gt_y2 - gt_y1
             # Resize mini mask to size of GT box
             placeholder[gt_y1:gt_y2, gt_x1:gt_x2] = \
-                np.round(utils.resize(class_mask, (gt_h, gt_w))).astype(bool)
+                np.round(utils.resize(class_mask, (gt_h, gt_w), order=0)).astype(bool)
             # Place the mini batch in the placeholder
             class_mask = placeholder
 
         # Pick part of the mask and resize it
         y1, x1, y2, x2 = rois[i].astype(np.int32)
         m = class_mask[y1:y2, x1:x2]
-        mask = utils.resize(m, config.MASK_SHAPE)
+        mask = utils.resize(m, config.MASK_SHAPE, order=0)
         masks[i, :, :, class_id] = mask
 
     return rois, roi_gt_class_ids, bboxes, masks
@@ -1731,12 +1951,102 @@ class DataGenerator(KU.Sequence):
             image, image_meta, gt_class_ids, gt_boxes, gt_masks = \
                 load_image_gt(self.dataset, self.config, image_id,
                               augmentation=self.augmentation)
-
+            
+            
             # Skip images that have no instances. This can happen in cases
             # where we train on a subset of classes and the image doesn't
             # have any of the classes we care about.
             if not np.any(gt_class_ids > 0):
                 continue
+            
+            #---NEW: Load gt cluster masks for pp head ---------
+            # (optional, not treated as class)
+            if getattr(self.config, "PP_USE_GT_CLUSTERS", False):
+                cluster_mask_full = self.dataset.load_cluster_input_masks(image_id)
+                
+                if cluster_mask_full is None:
+                    #if no cluster masks exist, initialize empty mask array
+                    cluster_mask_full = np.zeros(
+                        (image.shape[0], image.shape[1], self.config.MAX_CLUSTERS),
+                        dtype=np.bool_
+                    )
+
+                else:
+                    if cluster_mask_full.ndim == 2:
+                        #single channel mask: add channel dimension and pad
+                        cluster_mask_full = cluster_mask_full[...,np.newaxis]
+                    c = cluster_mask_full.shape[-1]
+                    
+                    if c < self.config.MAX_CLUSTERS:
+                        cluster_mask_full = np.pad(cluster_mask_full, ((0,0), (0,0), (0,self.config.MAX_CLUSTERS-c)),
+                                          mode='constant') 
+                        
+                    else:
+                        cluster_mask_full = cluster_mask_full[..., :self.config.MAX_CLUSTERS]
+
+                    #--- Resize clusters to match image/mask
+                    # original_image = self.dataset.load_image(image_id)
+                    # _, window, scale, padding, crop = utils.resize_image(
+                    #     original_image,  # original image before molding
+                    #     min_dim=self.config.IMAGE_MIN_DIM,
+                    #     min_scale=self.config.IMAGE_MIN_SCALE,
+                    #     max_dim=self.config.IMAGE_MAX_DIM,
+                    #     mode=self.config.IMAGE_RESIZE_MODE
+                    # )
+                    m = parse_image_meta(image_meta[np.newaxis,...])
+                    window = m["window"][0]
+                    image_shape = m["image_shape"][0]
+                    scale = m["scale"][0]
+
+                    #derive padding
+                    padding = [
+                        (window[0], image_shape[0]-window[2]), #top, bottom
+                        (window[1], image_shape[1] - window[3]) ,#left, right
+                        (0,0)
+                    ]
+                    cluster_mask_full = utils.resize_mask(cluster_mask_full, scale, padding, crop=None)
+                    
+                    #at this point, only have full resolution cluster
+                    
+                
+                    H,W = cluster_mask_full.shape[:2] #height, width of full image
+                    C = cluster_mask_full.shape[-1] #channel?
+
+                    #generate "full image" boxes for each cluster
+                    full_image_bbox = np.tile(
+                        np.array([[0, 0, H, W]], dtype=np.int32),
+                        (C, 1)
+                    )
+                    #geenerate mini cluster for loss layer
+                    cluster_mask_mini = utils.minimize_mask(
+                        full_image_bbox,    # boxes for each cluster
+                        cluster_mask_full,       # full-res cluster masks
+                        self.config.MINI_MASK_SHAPE # mini-mask shape. e.g., 56x56
+                                                        )
+
+
+                    #at this point we have both a full res and mini res cluster mask
+
+                    # BELOW IS OLD, AND MUST USE BOTH MINI FOR CLUSTER AND PARTICLE                   
+                    # if self.config.USE_MINI_MASK or self.config.CLUSTER_MINI_MASK:
+                    # if getattr(self.config, "CLUSTER_MINI_MASK",False):
+
+                    #     H, W = cluster_mask.shape[:2]
+                    #     C = cluster_mask.shape[-1]
+
+                    #     #generate "full image" boxes for each cluster
+                    #     full_image_bbox = np.tile(
+                    #         np.array([[0, 0, H, W]], dtype=np.int32),
+                    #         (C, 1)
+                    #     )
+                        
+                    #     cluster_mask = utils.minimize_mask(
+                    #         full_image_bbox,    # boxes for each cluster
+                    #         cluster_mask,       # full-res cluster masks
+                    #         self.config.MINI_MASK_SHAPE # mini-mask shape. e.g., 56x56
+                    #                                        )
+                    
+
 
             # RPN Targets
             rpn_match, rpn_bbox = build_rpn_targets(image.shape, self.anchors,
@@ -1768,6 +2078,75 @@ class DataGenerator(KU.Sequence):
                 batch_gt_masks = np.zeros(
                     (self.batch_size, gt_masks.shape[0], gt_masks.shape[1],
                      self.config.MAX_GT_INSTANCES), dtype=gt_masks.dtype)
+                
+                #---- NEW: batch container for PP cluster masks
+                if getattr(self.config, "PP_USE_GT_CLUSTERS", False):
+
+                    if not self.config.USE_MINI_MASK:
+                        ##head gets full res
+                        batch_cluster_masks_head = np.zeros(
+                            (self.batch_size,
+                            gt_masks.shape[0],
+                            gt_masks.shape[1],
+                            self.config.MAX_CLUSTERS),
+                            dtype=np.bool_
+                            )
+
+
+                        # loss always gets mini
+                        batch_cluster_masks_loss = np.zeros(
+                            (self.batch_size, 
+                             self.config.MINI_MASK_SHAPE[0], 
+                             self.config.MINI_MASK_SHAPE[1],
+                             self.config.MAX_CLUSTERS),
+                             dtype=np.bool_
+
+                        )
+
+                    else: 
+                        # mini everywhere (both head and loss)
+                        batch_cluster_masks_head = np.zeros(
+                            (self.batch_size, 
+                             self.config.MINI_MASK_SHAPE[0], 
+                             self.config.MINI_MASK_SHAPE[1],
+                             self.config.MAX_CLUSTERS),
+                             dtype=np.bool_
+
+                        )
+
+                        
+                        batch_cluster_masks_loss = np.zeros(
+                            (self.batch_size, 
+                             self.config.MINI_MASK_SHAPE[0], 
+                             self.config.MINI_MASK_SHAPE[1],
+                             self.config.MAX_CLUSTERS),
+                             dtype=np.bool_
+
+                        )
+
+
+
+                        
+
+
+                    # if self.config.CLUSTER_MINI_MASK:
+                    #     batch_cluster_masks = np.zeros(
+                    #         (self.batch_size, 
+                    #          self.config.MINI_MASK_SHAPE[0], 
+                    #          self.config.MINI_MASK_SHAPE[1],
+                    #          self.config.MAX_CLUSTERS),
+                    #          dtype=np.bool_
+
+                    #     )
+                    # else: 
+                    #     batch_cluster_masks = np.zeros(
+                    #         (self.batch_size,
+                    #         gt_masks.shape[0],
+                    #         gt_masks.shape[1],
+                    #         self.config.MAX_CLUSTERS),
+                    #         dtype=np.bool_
+                    #     )
+
                 if self.random_rois:
                     batch_rpn_rois = np.zeros(
                         (self.batch_size, rpn_rois.shape[0], 4), dtype=rpn_rois.dtype)
@@ -1797,6 +2176,20 @@ class DataGenerator(KU.Sequence):
             batch_gt_class_ids[b, :gt_class_ids.shape[0]] = gt_class_ids
             batch_gt_boxes[b, :gt_boxes.shape[0]] = gt_boxes
             batch_gt_masks[b, :, :, :gt_masks.shape[-1]] = gt_masks
+
+            # ---- NEW: add cluster masks to batch
+            if getattr(self.config, "PP_USE_GT_CLUSTERS", False):
+                if not self.config.USE_MINI_MASK:
+
+                    #not using mini for pp, so need full for head and mini for loss
+                    batch_cluster_masks_head[b] = cluster_mask_full
+                    batch_cluster_masks_loss[b] = cluster_mask_mini
+
+                else:
+                    batch_cluster_masks_head[b] = cluster_mask_mini
+                    batch_cluster_masks_loss[b] = cluster_mask_mini
+
+
             if self.random_rois:
                 batch_rpn_rois[b] = rpn_rois
                 if self.detection_targets:
@@ -1819,6 +2212,15 @@ class DataGenerator(KU.Sequence):
                     batch_mrcnn_class_ids, -1)
                 outputs.extend(
                     [batch_mrcnn_class_ids, batch_mrcnn_bbox, batch_mrcnn_mask])
+
+        #--- NEW: append pp cluster masks to inputs ---
+        if getattr(self.config, "PP_USE_GT_CLUSTERS", False):
+
+            #always aooend this (used by pp head)
+            inputs.append(batch_cluster_masks_head)
+            inputs.append(batch_cluster_masks_loss)
+
+    
 
         return inputs, outputs
 
@@ -1895,9 +2297,64 @@ class MaskRCNN(object):
                 input_gt_masks = KL.Input(
                     shape=[config.IMAGE_SHAPE[0], config.IMAGE_SHAPE[1], None],
                     name="input_gt_masks", dtype=bool)
+
+            #---- NEW: OPTIONAL GT cluster masks for PP heaed
+            if config.USE_PP_HEAD and config.PP_USE_GT_CLUSTERS:
+                if config.USE_MINI_MASK:
+                    input_gt_cluster_masks = KL.Input(
+                    shape=[config.MINI_MASK_SHAPE[0], 
+                           config.MINI_MASK_SHAPE[1], 
+                           config.MAX_CLUSTERS],
+                    name = "input_gt_cluster_head",
+                    dtype = tf.float32 #may need to change to float?
+                    )
+
+                    #both clusters fed to head and loss layer are already mini, just do this for downstream ease
+                    cluster_masks_head = input_gt_cluster_masks_head
+                    cluster_masks_loss = input_gt_cluster_masks_head
+
+                    # ---- PRINT STATIC SHAPES ----
+                    print("GT cluster head shape (training, mini):", K.int_shape(cluster_masks_head))
+                    print("GT cluster loss shape (training, mini):", K.int_shape(cluster_masks_loss))
+                    
+                else: 
+                    input_gt_cluster_masks_head = KL.Input(
+                        shape=[config.IMAGE_SHAPE[0], 
+                               config.IMAGE_SHAPE[1], 
+                               config.MAX_CLUSTERS],
+                        name = "input_gt_cluster_masks_head",
+                        dtype = tf.float32 #may need to change to float?
+                    )
+
+                    #mini version for loss only
+
+                    input_gt_cluster_masks_loss = KL.Input(
+                    shape=[config.MINI_MASK_SHAPE[0], 
+                           config.MINI_MASK_SHAPE[1], 
+                           config.MAX_CLUSTERS],
+                    name = "input_gt_cluster_masks_loss",
+                    dtype = tf.float32 #may need to change to float?
+                    )
+
+                    cluster_masks_head = input_gt_cluster_masks_head
+                    cluster_masks_loss = input_gt_cluster_masks_loss
+
+                    print("GT cluster head shape (training, full):", K.int_shape(cluster_masks_head))
+                    print("GT cluster loss shape (training, mini):", K.int_shape(cluster_masks_loss))
+
+
         elif mode == "inference":
             # Anchors in normalized coordinates
             input_anchors = KL.Input(shape=[None, 4], name="input_anchors")
+
+            if config.USE_PP_HEAD and config.PP_USE_GT_CLUSTERS:
+                input_gt_cluster_masks = KL.Input(
+                    shape=[config.IMAGE_SHAPE[0], config.IMAGE_SHAPE[1], config.MAX_CLUSTERS],
+                    name = "input_gt_cluster_masks",
+                    dtype = tf.float32 #may need to change to float?
+                )
+
+    
 
         # Build the shared convolutional layers.
         # Bottom-up Layers
@@ -2016,14 +2473,150 @@ class MaskRCNN(object):
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
 
-            mrcnn_mask = build_fpn_mask_graph(rois, mrcnn_feature_maps,
-                                              input_image_meta,
-                                              config.MASK_POOL_SIZE,
-                                              config.NUM_CLASSES,
-                                              train_bn=config.TRAIN_BN)
+            #----- STANDARD MASK HEAD ---------
+            # mrcnn_mask = build_fpn_mask_graph(rois, mrcnn_feature_maps,
+            #                                   input_image_meta,
+            #                                   config.MASK_POOL_SIZE,
+            #                                   config.NUM_CLASSES,
+            #                                   train_bn=config.TRAIN_BN)
+
+
+            #------- PP HEAD LOGIC -------------
+            cluster_source=None
+            mrcnn_mask = None
+            mrcnn_pp_mask = None
+
+            if config.USE_PP_HEAD:
+                if config.PP_USE_GT_CLUSTERS:
+                    #testing with GT clusters, skip standard mask head
+                    cluster_source = cluster_masks_head #use GT clusters - will be same size as the PP GTs, either mini or full size based on config
+                    if not config.PP_BYPASS_MASK_HEAD:
+
+                        #build standard mask head
+                        mrcnn_mask = build_fpn_mask_graph(rois, mrcnn_feature_maps,
+                                                input_image_meta,
+                                                config.MASK_POOL_SIZE,
+                                                config.NUM_CLASSES,
+                                                train_bn=config.TRAIN_BN)
+                        
+                else:
+                    #use predicted clusters from mask head
+                    #standard mask head must be built
+                    mrcnn_mask = build_fpn_mask_graph(rois, mrcnn_feature_maps,
+                                                    input_image_meta,
+                                                    config.MASK_POOL_SIZE,
+                                                    config.NUM_CLASSES,
+                                                    train_bn=config.TRAIN_BN)
+                    cluster_source = mrcnn_mask
+                ## PP HEAD
+                if cluster_source is not None:
+                    mrcnn_pp_mask_class, mrcnn_pp_mask_single = build_pp_head(rois, mrcnn_feature_maps, 
+                                                input_image_meta,
+                                                config.MASK_POOL_SIZE,
+                                                num_classes = config.NUM_CLASSES,
+                                                cluster_masks=cluster_source,
+                                                max_clusters = config.MAX_CLUSTERS,
+                                                train_bn=config.TRAIN_BN
+                                                )
+                    
+            else: #standard run: build mask head normally
+                mrcnn_mask = build_fpn_mask_graph(rois, mrcnn_feature_maps,
+                                                    input_image_meta,
+                                                    config.MASK_POOL_SIZE,
+                                                    config.NUM_CLASSES,
+                                                    train_bn=config.TRAIN_BN)
+
+
+            #always build head, so that features can be extracted later for testing, even if not using in training
+            proxy_feats, proxy_feats_class, proxy_feats_bbox = add_proxy_head(rois, mrcnn_feature_maps, input_image_meta,
+                                                                                  config.POOL_SIZE, proxy_dim=128,
+                                                                                  num_classes = config.NUM_CLASSES,
+                                                                                  train_bn=config.TRAIN_BN)
+
+                # print("Static Shapes:")
+                # print("proxy_feats: ", K.int_shape(proxy_feats))
+                # print("labels: ", K.int_shape(target_class_ids))
+                # print("proxy_feats_class", K.int_shape(proxy_feats_class))
+                # print("proxy_feats_bbox: ", proxy_feats_bbox)
+            
+
+            #-----LOSSES ---------------------------
+            
+            # --------MASK FOR LOSS
+            if config.USE_PP_HEAD and config.PP_BYPASS_MASK_HEAD:
+                mask_for_loss = mrcnn_pp_mask_class
+            else: 
+                mask_for_loss = mrcnn_mask
+
+
+
+            if config.USE_STRUCT_LOSS:
+                target_class_ids_one_hot = KL.Lambda(
+                    lambda x: tf.one_hot(tf.cast(x, tf.int32), depth= config.NUM_CLASSES)
+                )(target_class_ids)
+                    
+                print("Labels (one hot)", K.int_shape(target_class_ids_one_hot))
+                fisher_loss_tensor = KL.Lambda(
+                    lambda x: fisher_loss(x[0], x[1]), name="fisher_loss"
+                )([proxy_feats_class, target_class_ids_one_hot])
+
+                equip_loss_tensor = KL.Lambda(
+                    lambda x: equip_loss(x[0], x[1]), name="equip_loss"
+                )([proxy_feats_bbox, target_bbox])
+
 
             # TODO: clean up (use tf.identify if necessary)
             output_rois = KL.Lambda(lambda x: x * 1, name="output_rois")(rois)
+
+            # if config.USE_PP_HEAD and cluster_source is not None:
+            #     _ = PPLossLayer(name="pp_loss_layer")([
+            #         mrcnn_pp_mask, 
+            #         rois,
+            #         cluster_source
+            #     ])
+
+
+            # print("mrcnn_pp_mask_single:", mrcnn_pp_mask_single, mrcnn_pp_mask_single.dtype)
+            # print("mrcnn_bboxes:", mrcnn_bbox, mrcnn_bbox.dtype)
+            # print("target_class_ids", target_class_ids, target_class_ids.dtype)
+            # print("rois:", rois, rois.dtype)
+            # print("cluster_source:", cluster_source, cluster_source.dtype)
+
+            if config.USE_PP_HEAD and cluster_source is not None:
+
+                # bbox_cov_layer = self.PPLossLayer = PPLossLayerV3(
+                #     mode = 'bbox_global_coverage',
+                #     visualize = config.BBOX_COV_VIS,
+                #     name = "bbox_coverage_loss"
+                # )
+                
+                # bbox_cov_loss = bbox_cov_layer([mrcnn_pp_mask_single, rois, target_class_ids, mrcnn_bbox, cluster_source])
+                
+                
+                # bbox_cov_loss = PPLossLayerV3(
+                #     mode = 'bbox_global_coverage',  
+                #     visualize = config.BBOX_COV_VIS,
+                #     name="bbox_coverage_loss")([mrcnn_pp_mask_single, rois, target_class_ids, mrcnn_bbox, cluster_source])
+
+                if not getattr(config, "PP_BYPASS_LOSSES", False): #for testing where OOM happens
+
+                    pp_cov_loss = PPLossLayerV3(
+                        mode = "pp_global_coverage",
+                        visualize =False,
+                        name = "pp_coverage_loss"
+                    )([mrcnn_pp_mask_single, rois, target_class_ids, mrcnn_bbox, cluster_masks_loss])
+
+                    pp_leak_loss = PPLossLayerV3(
+                        mode = "pp_global_leakage",
+                        visualize=False,
+                        name = "pp_leakage_loss"
+                    )([mrcnn_pp_mask_single, rois, target_class_ids, mrcnn_bbox, cluster_masks_loss])
+                else:
+                    #dummy outputs so model.build still works
+
+                    pp_cov_loss = KL.Lambda(lambda x: tf.constant(0.0), name="pp_coverage_loss")(rois)
+                    pp_leak_loss = KL.Lambda(lambda x: tf.constant(0.0), name="pp_leakage_loss")(rois)
+
 
             # Losses
             rpn_class_loss = KL.Lambda(lambda x: rpn_class_loss_graph(*x), name="rpn_class_loss")(
@@ -2035,18 +2628,52 @@ class MaskRCNN(object):
             bbox_loss = KL.Lambda(lambda x: mrcnn_bbox_loss_graph(*x), name="mrcnn_bbox_loss")(
                 [target_bbox, target_class_ids, mrcnn_bbox])
             mask_loss = KL.Lambda(lambda x: mrcnn_mask_loss_graph(*x), name="mrcnn_mask_loss")(
-                [target_mask, target_class_ids, mrcnn_mask])
+                [target_mask, 
+                 target_class_ids, 
+                 mask_for_loss]) #use selected mask instead of mrcnn_mask
 
             # Model
             inputs = [input_image, input_image_meta,
                       input_rpn_match, input_rpn_bbox, input_gt_class_ids, input_gt_boxes, input_gt_masks]
+            if config.USE_PP_HEAD and config.PP_USE_GT_CLUSTERS:
+                inputs.append(input_gt_cluster_masks_head)
+                inputs.append(input_gt_cluster_masks_loss)
+                
+
             if not config.USE_RPN_ROIS:
                 inputs.append(input_rois)
+
             outputs = [rpn_class_logits, rpn_class, rpn_bbox,
-                       mrcnn_class_logits, mrcnn_class, mrcnn_bbox, mrcnn_mask,
+                       mrcnn_class_logits, mrcnn_class, mrcnn_bbox,
+                       mask_for_loss,# mrcnn_mask,
                        rpn_rois, output_rois,
                        rpn_class_loss, rpn_bbox_loss, class_loss, bbox_loss, mask_loss]
+
+            if config.USE_PP_HEAD:
+                outputs += [mrcnn_pp_mask_class, mrcnn_pp_mask_single, 
+                             pp_cov_loss, pp_leak_loss]#,pp_roi_union_cov_loss]# pp_roi_union_cov_loss,pp_leak_loss ]
+
+
+            
+            
+            if config.USE_STRUCT_LOSS:
+                outputs += [fisher_loss_tensor, equip_loss_tensor]
+
+            
+            
+            
+
             model = KM.Model(inputs, outputs, name='mask_rcnn')
+
+            if not config.USE_STRUCT_LOSS:
+                for layer in model.layers:
+                    if "proxy" in layer.name:
+                        layer.trainable=False
+
+           
+
+
+        #----INFERENCE--------
         else:
             # Network Heads
             # Proposal classifier and BBox regressor heads
@@ -2064,15 +2691,135 @@ class MaskRCNN(object):
 
             # Create masks for detections
             detection_boxes = KL.Lambda(lambda x: x[..., :4])(detections)
-            mrcnn_mask = build_fpn_mask_graph(detection_boxes, mrcnn_feature_maps,
-                                              input_image_meta,
-                                              config.MASK_POOL_SIZE,
-                                              config.NUM_CLASSES,
-                                              train_bn=config.TRAIN_BN)
 
-            model = KM.Model([input_image, input_image_meta, input_anchors],
-                             [detections, mrcnn_class, mrcnn_bbox,
-                                 mrcnn_mask, rpn_rois, rpn_class, rpn_bbox],
+            mrcnn_mask = None
+            mrcnn_pp_mask_class = None
+            mrcnn_pp_mask_single = None
+            cluster_source = None
+
+            if getattr(config, "VERBOSE_INFERENCE_BUILD", True):
+                print("\n[INFERENCE BUILD]")
+                print(f"  USE_PP_HEAD           : {config.USE_PP_HEAD}")
+                print(f"  PP_USE_GT_CLUSTERS    : {config.PP_USE_GT_CLUSTERS}")
+                print(f"  PP_BYPASS_MASK_HEAD   : {config.PP_BYPASS_MASK_HEAD}")
+
+
+            if config.USE_PP_HEAD:
+                if getattr(config, "VERBOSE_INFERENCE_BUILD", True):
+                    print("  -> PP HEAD ENABLED")
+                if config.PP_USE_GT_CLUSTERS:
+                    #testing, use GT clusters in inference
+                    if getattr(config, "VERBOSE_INFERENCE_BUILD", True):
+                        print("  --> Using GT cluster masks for PP Head")
+                    cluster_source  = input_gt_cluster_masks
+
+                    if config.PP_BYPASS_MASK_HEAD:
+                        if getattr(config, "VERBOSE_INFERENCE_BUILD", True):
+                            print("  ---> Bypassing standard/old mask head (PP uses GT clusters only)")
+
+                    else:
+                        if getattr(config, "VERBOSE_INFERENCE_BUILD", True):
+                            print("  ---> Building standard mask head")
+                        #build standard mask head if not bypassed
+                        mrcnn_mask = build_fpn_mask_graph(detection_boxes, mrcnn_feature_maps,
+                                                    input_image_meta,
+                                                    config.MASK_POOL_SIZE,
+                                                    config.NUM_CLASSES,
+                                                    train_bn=config.TRAIN_BN)
+                    
+
+                        
+                else:
+                    if getattr(config, "VERBOSE_INFERENCE_BUILD", True):
+                        print("  --> Using predicted cluster masks for PP head")
+                        print("  --> Building standard mask head (for cluster predictions)")
+                    #if not using GT clusters, use predicted clusters
+                    mrcnn_mask = build_fpn_mask_graph(detection_boxes, mrcnn_feature_maps,
+                                                    input_image_meta,
+                                                    config.MASK_POOL_SIZE,
+                                                    config.NUM_CLASSES,
+                                                    train_bn=config.TRAIN_BN)
+                    
+                    cluster_source = mrcnn_mask
+
+                # PP head
+                if cluster_source is not None:
+                    if getattr(config, "VERBOSE_INFERENCE_BUILD", True):
+                        print(f"  --> Building PP head with cluster_source: {cluster_source}")
+                    mrcnn_pp_mask_class, mrcnn_pp_mask_single =  build_pp_head(
+                                                  detection_boxes, mrcnn_feature_maps, 
+                                                  input_image_meta,
+                                                  config.MASK_POOL_SIZE,
+                                                  num_classes = config.NUM_CLASSES,
+                                                  cluster_masks=cluster_source,
+                                                  max_clusters = config.MAX_CLUSTERS,
+                                                  train_bn=config.TRAIN_BN)
+                    
+            #if not using PP head, do standard pp predictions using old mask head
+            else:
+                if getattr(config, "VERBOSE_INFERENCE_BUILD", True):
+                    print("  -> PP Head Disabled")
+                    print("  -> Standard mask head only")
+                mrcnn_mask = build_fpn_mask_graph(detection_boxes, mrcnn_feature_maps,
+                                                  input_image_meta,
+                                                  config.MASK_POOL_SIZE,
+                                                  config.NUM_CLASSES,
+                                                  train_bn=config.TRAIN_BN)
+
+
+            #     if config.PP_BYPASS_MASK_HEAD:
+            #         #only build pp head
+            #         mrcnn_pp_mask_class, _ = build_pp_head(
+            #                                       detection_boxes, mrcnn_feature_maps, 
+            #                                       input_image_meta,
+            #                                       config.MASK_POOL_SIZE,
+            #                                       num_classes = config.NUM_CLASSES,
+            #                                       cluster_masks=cluster_source,
+            #                                       max_clusters = config.MAX_CLUSTERS,
+            #                                       train_bn=config.TRAIN_BN)
+                    
+            #     else:
+            #         #build standard head
+            #         mrcnn_mask = build_fpn_mask_graph(detection_boxes, mrcnn_feature_maps,
+            #                                         input_image_meta,
+            #                                         config.MASK_POOL_SIZE,
+            #                                         config.NUM_CLASSES,
+            #                                         train_bn=config.TRAIN_BN)
+            #         #build PP head as well
+            #         mrcnn_pp_mask = build_pp_head(detection_boxes, mrcnn_feature_maps, 
+            #                                       input_image_meta,
+            #                                       config.MASK_POOL_SIZE,
+            #                                       num_classes = config.NUM_CLASSES,
+            #                                       cluster_masks=None,
+            #                                       max_clusters = config.MAX_CLUSTERS,
+            #                                       train_bn=config.TRAIN_BN)
+            # else: #only build standard head
+            #     mrcnn_mask = build_fpn_mask_graph(detection_boxes, mrcnn_feature_maps,
+            #                                         input_image_meta,
+            #                                         config.MASK_POOL_SIZE,
+            #                                         config.NUM_CLASSES,
+            #                                         train_bn=config.TRAIN_BN)
+            
+            
+            # ---- DEFINE INPUTS ----
+            inputs = [input_image, input_image_meta, input_anchors]
+            if config.USE_PP_HEAD and config.PP_USE_GT_CLUSTERS:
+                inputs.append(input_gt_cluster_masks)
+                        
+                        
+            outputs = [detections, mrcnn_class, mrcnn_bbox]
+
+            if mrcnn_mask is not None:
+                outputs.append(mrcnn_mask)
+            if mrcnn_pp_mask_class is not None:
+                outputs.append(mrcnn_pp_mask_class)
+        
+
+            outputs += [rpn_rois, rpn_class, rpn_bbox]
+
+            model = KM.Model(inputs,outputs,
+                             #[detections, mrcnn_class, mrcnn_bbox,
+                             #    mrcnn_mask, rpn_rois, rpn_class, rpn_bbox],
                              name='mask_rcnn')
 
         # Add multi-GPU support.
@@ -2087,6 +2834,8 @@ class MaskRCNN(object):
         Returns:
             The path of the last checkpoint file
         """
+
+
         # Get directory names. Each directory corresponds to a model
         dir_names = next(os.walk(self.model_dir))[1]
         key = self.config.NAME.lower()
@@ -2109,6 +2858,21 @@ class MaskRCNN(object):
                 errno.ENOENT, "Could not find weight files in {}".format(dir_name))
         checkpoint = os.path.join(dir_name, checkpoints[-1])
         return checkpoint
+
+    def find_last_in_folder(self, folder):
+        if not os.path.exists(folder):
+            raise FileNotFoundError(f"Folder does not exist: {folder}")
+        
+        files = os.listdir(folder)
+
+        #find last checkpoint
+        checkpoints = [f for f in files if f.startswith("mask_rcnn")]
+        checkpoints = sorted(checkpoints)
+        if not checkpoints:
+            raise FileNotFoundError(f"No checkpoint files in {folder}")
+        checkpoint = os.path.join(folder, checkpoints[-1])
+        return checkpoint
+        
 
     def load_weights(self, filepath, by_name=False, exclude=None):
         """Modified version of the corresponding Keras function with
@@ -2177,6 +2941,13 @@ class MaskRCNN(object):
         loss_names = [
             "rpn_class_loss",  "rpn_bbox_loss",
             "mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss"]
+        
+        if self.config.USE_STRUCT_LOSS:
+            loss_names.extend(["fisher_loss", "equip_loss"])
+
+        if self.config.USE_PP_HEAD:
+            loss_names.extend(["pp_coverage_loss", "pp_leakage_loss"])#, pp_leakage_loss"pp_roi_union_coverage_loss"])
+
         for name in loss_names:
             layer = self.keras_model.get_layer(name)
             if layer.output in self.keras_model.losses:
@@ -2199,6 +2970,7 @@ class MaskRCNN(object):
             optimizer=optimizer,
             loss=[None] * len(self.keras_model.outputs))
 
+      
         # Add metrics for losses
         for name in loss_names:
             if name in self.keras_model.metrics_names:
@@ -2325,13 +3097,14 @@ class MaskRCNN(object):
         # Pre-defined layer regular expressions
         layer_regex = {
             # all layers but the backbone
-            "heads": r"(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
+            "heads": r"(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)|(pp_mask_head_.*)",
             # From a specific Resnet stage and up
-            "3+": r"(res3.*)|(bn3.*)|(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
-            "4+": r"(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
-            "5+": r"(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
+            "3+": r"(res3.*)|(bn3.*)|(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)|(pp_mask_head_.*)",
+            "4+": r"(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)|(pp_mask_head_.*)",
+            "5+": r"(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)|(pp_mask_head_.*)",
             # All layers
             "all": ".*",
+            "mask_only":r"(mrcnn\_.*)|(pp_mask_head_.*)",
         }
 
         stage_name = layers
@@ -2357,7 +3130,7 @@ class MaskRCNN(object):
                           mode=self.config.ES_MODE,
                           verbose = self.config.ES_VERBOSE)
                           
-       
+        #bbox_cov_vis = BBoxCoverageVisualizer(log_dir=self.log_dir, max_images=1, visualize_freq=1)
 
 
         callbacks = [
@@ -2365,7 +3138,8 @@ class MaskRCNN(object):
                                         histogram_freq=0, write_graph=True, write_images=False),
             keras.callbacks.ModelCheckpoint(self.checkpoint_path,
                                             verbose=0, save_weights_only=True),
-            early_stopping, 
+            early_stopping
+            #bbox_cov_vis
         
         ]
             
@@ -2451,7 +3225,50 @@ class MaskRCNN(object):
         windows = np.stack(windows)
         return molded_images, image_metas, windows
 
+    def mold_cluster_masks(self,mask_list, image_metas):
+        all_molded_masks=[]
+
+        for masks, meta in zip(mask_list, image_metas):
+            if masks is None:
+                empty = np.zeros(
+                    (self.config.IMAGE_MAX_DIM, self.config.IMAGE_MAX_DIM, 0), dtype=np.float32
+                )
+
+                all_molded_masks.append(empty)
+                continue
+            
+            if masks.ndim == 2:
+                masks = [masks]
+            elif masks.ndim == 3:
+                masks = [masks[:,:, i] for i in range(masks.shape[-1])]
+           
+
+
+            scale = meta[11]
+            y1, x1, y2, x2 = meta[7:11]
+            top_pad = y1
+            left_pad = x1
+            bottom_pad = self.config.IMAGE_MAX_DIM-y2
+            right_pad = self.config.IMAGE_MAX_DIM -x2
+
+            padding = [(top_pad, bottom_pad), (left_pad, right_pad), (0,0)]
+
         
+            molded_masks = []
+            for mask in masks:
+                mask = mask.astype(np.uint8)
+
+                if mask.ndim == 2:
+                    mask = mask[:,:, np.newaxis]  # (H, W, 1)
+
+                resized_mask = utils.resize_mask(mask, scale, padding)
+                molded_masks.append(resized_mask[:,:,0])
+
+            molded_masks = np.stack(molded_masks, axis=-1) #[H,W,N]
+            all_molded_masks.append(molded_masks)
+
+        all_molded_masks = np.stack(all_molded_masks, axis=0)
+        return all_molded_masks
 
     def unmold_detections(self, detections, mrcnn_mask, original_image_shape,
                           image_shape, window):
@@ -2517,7 +3334,7 @@ class MaskRCNN(object):
             if full_masks else np.empty(original_image_shape[:2] + (0,))
 
         return boxes, class_ids, scores, full_masks
-    def detect(self, images, verbose=0):
+    def detect(self, images, gt_cluster_masks=None, verbose=0):
         """Runs the detection pipeline.
 
         images: List of images, potentially of different sizes.
@@ -2538,11 +3355,14 @@ class MaskRCNN(object):
                 log("image", image)
 
         # Mold inputs to format expected by the neural network
+        #print(f"IMAGES SHAPE: {images[0].shape}")
+        #print(f"# OF IMAGES: {len(images)}")
         molded_images, image_metas, windows = self.mold_inputs(images)
 
         # Validate image sizes
         # All images in a batch MUST be of the same size
         image_shape = molded_images[0].shape
+        #print(f"Molded Shape: {molded_images[0].shape}")
         for g in molded_images[1:]:
             assert g.shape == image_shape,\
                 "After resizing, all images must have the same size. Check IMAGE_RESIZE_MODE and image sizes."
@@ -2557,9 +3377,18 @@ class MaskRCNN(object):
             log("molded_images", molded_images)
             log("image_metas", image_metas)
             log("anchors", anchors)
+
+        inputs = [molded_images, image_metas, anchors]
+
+        if gt_cluster_masks is not None: 
+           # print(f"GT MASK SHAPE: {gt_cluster_masks[0].shape}")
+           # print(f"# CLusters: {len(gt_cluster_masks)}")
+            molded_masks = self.mold_cluster_masks(gt_cluster_masks, image_metas)
+           # print(f"Molded Mask shape: {molded_masks[0].shape}")
+            inputs.append(molded_masks)
         # Run object detection
         detections, _, _, mrcnn_mask, _, _, _ =\
-            self.keras_model.predict([molded_images, image_metas, anchors], verbose=0)
+            self.keras_model.predict(inputs, verbose=0)
         # Process detections
         results = []
         for i, image in enumerate(images):
@@ -2742,7 +3571,11 @@ class MaskRCNN(object):
         # TODO: can this be optimized to avoid duplicating the anchors?
         anchors = np.broadcast_to(anchors, (self.config.BATCH_SIZE,) + anchors.shape)
         model_in = [molded_images, image_metas, anchors]
-
+        
+        #PP head, feed dummy gt clusters if needed:
+        if any("input_gt_cluster_masks" in i.name for i in model.inputs):
+            dummy_clusters = np.zeros((self.config.BATCH_SIZE, image_shape[0], image_shape[1], 1), dtype=np.float32)
+            model_in.append(dummy_clusters)
         # Run inference
         # if model.uses_learning_phase and not isinstance(K.learning_phase(), int):
         #     model_in.append(0.)

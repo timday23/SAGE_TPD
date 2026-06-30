@@ -241,3 +241,105 @@ class Config(object):
         #     if not a.startswith("__") and not callable(getattr(self, a)):
         #         print("{:30} {}".format(a, getattr(self, a)))
         print("\n")
+
+
+
+#################################################################################
+#################################################################################
+class SAGEConfig(Config):
+    """SAGE-specific overrides only (delta from base Config) 
+    
+    some things that are same as default config may be kept here for experimentation
+    """
+    # Give the configuration a recognizable name
+    NAME = "SAGE"
+
+    # Train on 1 GPU and 8 images per GPU. We can put multiple images on each
+    # GPU because the images are small. Batch size is 8 (GPUs * images/GPU).
+    GPU_COUNT = 1
+    IMAGES_PER_GPU = 2
+
+    # Number of classes (including background)
+    NUM_CLASSES = 1 + 1 #+ 1  # background + particle + cluster 
+    BACKBONE = "resnet101"
+
+
+    IMAGE_RESIZE_MODE = "square"
+    IMAGE_MIN_DIM = 1024
+    IMAGE_MAX_DIM =  1024
+    IMAGE_CHANNEL_COUNT = 3 #images are grayscale(8bit) so may need to change to 1
+    
+   
+    MEAN_PIXEL = np.array([123.7, 116.8, 103.9]) #may need to change to one value for grayscale
+
+    # Length of square anchor side in pixels
+    RPN_ANCHOR_SCALES = (32, 64, 128, 256,512)#(16,32,64,128,256)# #(16,32,64,128,256)#  # anchor side in pixels
+                #opt to change to smaller values to recognize smaller particles as well
+
+
+    # Increased Rois per image
+    TRAIN_ROIS_PER_IMAGE = 256
+        #increase from 128 to 256 to allow attempt more 
+    DETECTION_MAX_INSTANCES = 200 #increase from 100 to 200
+
+    # Use a small epoch since the data is simple
+    STEPS_PER_EPOCH =76 # 76 for 200 #20 for 60 #188 for 750
+                    
+    #non-maximum suppression threshold for detection
+    DETECTION_MIN_CONFIDENCE = 0.7
+    # use small validation steps since the epoch is small
+    VALIDATION_STEPS = 25#num of validation images/batch size
+    
+    #EARLY STOPPING
+    EARLY_STOPPING_MONITOR = 'val_loss'
+    EARLY_STOPPING_PATIENCE = 10 #number of epochs with no improvement required to stop
+    ES_RESTORE_BEST_WEIGHTS =True
+    ES_MODE= "min"
+    ES_VERBOSE = 0
+
+    USE_STRUCT_LOSS = False
+    USE_MINI_MASK=False
+
+    USE_PP_HEAD = False
+    PP_USE_GT_CLUSTERS = False
+    PP_BYPASS_MASK_HEAD = False
+    PP_BYPASS_LOSSES = False
+    MAX_CLUSTERS = 1
+    BBOX_COV_VIS=False
+    CLUSTER_MINI_MASK=False
+    LOSS_WEIGHTS = {
+        "rpn_class_loss": 1.,
+        "rpn_bbox_loss": 1.,
+        "mrcnn_class_loss": 1.,
+        "mrcnn_bbox_loss": 1.,
+        "mrcnn_mask_loss": 1.,
+        "pp_coverage_loss": 0.,
+        "pp_leakage_loss": 0.0,
+        
+    }
+    
+    def get_train_schedule(self, mode="default"):
+        """
+        Returns staged training schedule
+        """
+
+        if mode == "test":
+            return [
+                {"name": "heads", "epochs": 2, "lr": self.LEARNING_RATE},
+                {"name": "all", "epochs": 2, "lr": self.LEARNING_RATE / 10},
+            ]
+
+        if mode == "default":
+
+            return [
+            {"name": "heads", "epochs": 100, "lr": self.LEARNING_RATE},
+            {"name": "all", "epochs": 100, "lr": self.LEARNING_RATE / 10},
+        ]
+
+        raise ValueError(f"Unknown training mode: {mode}")
+
+
+            
+        
+    
+
