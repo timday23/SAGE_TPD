@@ -22,6 +22,7 @@ import cv2
 import urllib.request
 import shutil
 import zipfile
+import tempfile
 import warnings
 from distutils.version import LooseVersion
 from tqdm.notebook import tqdm
@@ -50,7 +51,9 @@ import re
 COCO_MODEL_URL = "https://github.com/matterport/Mask_RCNN/releases/download/v2.0/mask_rcnn_coco.h5"
 
 #URL from which to download zip of SAGE pretrained models
-PRETRAIN_URL = "https://github.com/timday23/SAGE_TPD/releases/download/v1.0.0/pretrained_models.zip"
+PRETRAIN_URL = "https://github.com/timday23/SAGE_TPD/releases/download/v1.1.0/pretrained_models.zip"
+
+Final_v1_URL = "https://github.com/timday23/SAGE_TPD/releases/download/Datasets/Final_v1.zip"
 
 
 ############################################################
@@ -923,6 +926,76 @@ def download_pretrained_models(pretrained_dir_path, verbose=1):
     
     if verbose > 0:
         print("... done downloading pretrained models!")
+
+def download_datasets(data_dir, force=False, test_mode=False, verbose=1):
+    """Download SAGE datasets from Releases.
+
+    data_dir: local path of SAGE datasets
+    force: if True, re-download the dataset even if it already exists
+    test_mode: if True, download only a small subset of the dataset for testing
+    """
+    if test_mode:
+        data_dir = os.path.join(data_dir, "_TEST_DATASET")
+
+    os.makedirs(data_dir, exist_ok=True)
+
+    expected = [
+        "Final_Trainv1_norm",
+        "Final_Valv1_norm",
+        "Final_Testv1_norm"
+    ]
+
+    #Check if already exists
+    if not force:
+        if all(os.path.exists(os.path.join(data_dir, d)) for d in expected):
+            if verbose > 0:
+                print("Dataset already exists. Skipping download.")
+            return
+
+    zip_path = os.path.join(data_dir, "datasets.zip")
+
+    #Download
+    if verbose:
+        print("Downloading datasets...")
+
+    with urllib.request.urlopen(Final_v1_URL) as resp, open(zip_path, 'wb') as out:
+        shutil.copyfileobj(resp, out)
+
+    #Extract
+    if verbose:
+        print("[SAGE] Extracting")
+
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        
+        names = z.namelist()
+
+        if verbose:
+            print("[SAGE] ZIP sample entries:", names[:5])
+
+        for member in z.namelist():
+
+            #skip directory entries:
+            if member.endswith('/'):
+                continue
+
+            parts=member.split('/')
+
+            #remove top-level directory
+            relative_path = os.path.join(*parts[1:])
+            target_path = os.path.join(data_dir, relative_path)
+
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+            with open(target_path, 'wb') as f:
+                f.write(z.read(member))
+
+    os.remove(zip_path)
+
+    # if not all(os.path.exists(os.path.join(data_dir, d)) for d in expected):
+    #     raise RuntimeError("[SAGE] Dataset extraction failed or structure mismatch.")
+
+    if verbose:
+        print("[SAGE] Done downloading datasets!")
 
 def norm_boxes(boxes, shape):
     """Converts boxes from pixel coordinates to normalized coordinates.
@@ -1978,7 +2051,8 @@ def print_verbose(message, verbose=1, level=1):
     
 def load_model(model_path, model_dict, model_list, model_dir, 
                config, target_class=None, image_size=None, 
-               custom_name=None, append_epoch=False):
+               custom_name=None, append_epoch=False,
+               pretrain_dir=None):
     """ Helper function to load models based on paths given in input"""
     
     model = modellib.MaskRCNN(mode="inference", 
@@ -1998,8 +2072,18 @@ def load_model(model_path, model_dict, model_list, model_dir,
     if custom_name is not None:
         model_name = f"{model_name}_{custom_name}"
 
+
+    #only append epoch for non-pretrained models
+    is_pretrained = (
+        pretrain_dir is not None and 
+        os.path.commonpath([
+            os.path.abspath(model_path),
+            os.path.abspath(pretrain_dir)
+        ]) == os.path.abspath(pretrain_dir)
+    )
+
     #optionally append epoch
-    if append_epoch:
+    if append_epoch and not is_pretrained:
         match = re.search(r'_(\d+)\.h5$', model_path)
         if match:
             epoch = match.group(1)
