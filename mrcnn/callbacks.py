@@ -9,7 +9,6 @@ import csv
 import time
 
 
-
 ##TODO - Add progress bars for mAP - try to match keras progress bars?
 class MeanAveragePrecisionCallback(keras.callbacks.Callback):
     def __init__(self, train_model, inference_model, dataset,
@@ -29,16 +28,20 @@ class MeanAveragePrecisionCallback(keras.callbacks.Callback):
         if inference_model.config.BATCH_SIZE != 1:
             raise ValueError("This callback only works with the bacth size of 1")
 
+        self.log_dir = log_dir or train_model.log_dir
         self._verbose_print = print if verbose > 0 else lambda *a, **k: None
 
         #tensorboard logging
         self.file_writer = tf.summary.create_file_writer(train_model.log_dir)
 
+        # Flag to check if inference model is built
+        self._inference_model_built = False
+
 
     def on_epoch_end(self, epoch, logs=None):
         
         #if epoch > 2 and (epoch+1)%self.calculate_map_at_every_X_epoch == 0:
-        if (epoch+1)%self.calculate_map_at_every_X_epoch == 0: #can i change it to start at epoch 1?
+        if (epoch+1) >= 1 and (epoch+1) %self.calculate_map_at_every_X_epoch == 0: #can i change it to start at epoch 1?
             self._verbose_print("Calculating mAP...")
             self._load_weights_for_model()
 
@@ -66,12 +69,93 @@ class MeanAveragePrecisionCallback(keras.callbacks.Callback):
 
         super().on_epoch_end(epoch, logs)
 
+    def _ensure_model_built(self, model, config):
+        """
+        Ensure that all dynamic heads (e.g., PP head with GT clusters) are fully built
+        so that Keras layers have fixed shapes and weights can be loaded.
+        """
+        # If the model has been called before, skip
+        if getattr(model, "_built_with_dummy_input", False):
+            return
+
+        # Create dummy inputs with batch_size=1
+        batch_size = 1
+        h, w, c = config.IMAGE_SHAPE
+        dummy_image = np.zeros((batch_size, h, w, c), dtype=np.float32)
+        dummy_meta = np.zeros((batch_size, config.IMAGE_META_SIZE), dtype=np.float32)
+        dummy_anchors = np.zeros((batch_size, config.POST_NMS_ROIS_INFERENCE, 4), dtype=np.float32)
+
+        inputs = [dummy_image, dummy_meta, dummy_anchors]
+
+        if config.USE_PP_HEAD and config.PP_USE_GT_CLUSTERS:
+            dummy_clusters = np.zeros((batch_size, h, w, config.MAX_CLUSTERS), dtype=np.float32)
+            inputs.append(dummy_clusters)
+
+        # Do a single forward pass to finalize all layer shapes
+        model.keras_model.predict(inputs)
+
+        # Mark that we already did the dummy call
+        model._built_with_dummy_input = True
+    
+    # def _load_weights_for_model(self):
+    #     last_weights_path = self.train_model.find_last_in_folder(self.log_dir)
+    #     if not last_weights_path or not os.path.exists(last_weights_path):
+    #         raise FileNotFoundError(f"No checkpoint found in {self.log_dir}")
+    #     self._verbose_print("Loaded weights for the inference model (last checkpoint of the train model): {0}".format(
+    #         last_weights_path))
+    #     self.inference_model.load_weights(last_weights_path,
+    #                                       by_name=True)
+        # Make sure model is fully built first
+        #self._ensure_model_built(self.inference_model, self.inference_model.config)
+
+        # Then load weights safely
+        #self.inference_model.keras_model.set_weights(self.train_model.keras_model.get_weights())
+        #self.inference_model.keras_model.set_weights(self.train_model.keras_model.get_weights())
+        #self._verbose_print("Copied weights from training model to inference model for mAP evaluation,")
+
+    # def _load_weights_for_model(self):
+    #     """
+    #     Load weights from disk and ensure the model is ready for mAP evaluation.
+    #     """
+    #     # Find last checkpoint
+    #     last_weights_path = self.train_model.find_last_in_folder(self.log_dir)
+    #     if not last_weights_path or not os.path.exists(last_weights_path):
+    #         raise FileNotFoundError(f"No checkpoint found in {self.log_dir}")
+    #     self._verbose_print(f"Loading weights for inference model: {last_weights_path}")
+
+    #     # Load weights safely
+    #     self.inference_model.load_weights(last_weights_path, by_name=True)
+
+    #     # Mark model as built
+    #     self.inference_model._built_with_dummy_input = True
+
     def _load_weights_for_model(self):
-        last_weights_path = self.train_model.find_last()
-        self._verbose_print("Loaded weights for the inference model (last checkpoint of the train model): {0}".format(
-            last_weights_path))
-        self.inference_model.load_weights(last_weights_path,
-                                          by_name=True)
+        last_weights_path = self.train_model.find_last_in_folder(self.log_dir)
+        if not last_weights_path or not os.path.exists(last_weights_path):
+            raise FileNotFoundError(f"No Checkpoint found in {self.log_dir}")
+        
+        # self._verbose_print("\n===== WEIGHT LOADING DEBUG =====")
+        # self._verbose_print(f"Checkpoint path: {last_weights_path}")
+
+        config = self.inference_model.config
+
+        self._verbose_print("Inference model expects inputs:")
+        # for inp in self.inference_model.keras_model.inputs:
+        #     self._verbose_print(f"  {inp.name}  shape={inp.shape}")
+
+        from mrcnn import model as modellib
+
+        #build fresh inference model:
+        new_model = modellib.MaskRCNN(
+            mode="inference",
+            config=config,
+            model_dir=self.log_dir
+        )
+
+        # Load weights into correctly-shaped graph
+        new_model.load_weights(last_weights_path, by_name=True)
+        self.inference_model = new_model
+        self._verbose_print("Inference model rebuilt and weights loaded cleanly.")
 
     def _calculate_mean_average_precision(self):
         AP50s = []
@@ -79,11 +163,43 @@ class MeanAveragePrecisionCallback(keras.callbacks.Callback):
         # Use a random subset of the data when a limit is defined
         np.random.shuffle(self.dataset_image_ids)
 
+        dataset = self.dataset
+        config = self.inference_model.config
+
         for image_id in self.dataset_image_ids[:self.dataset_limit]:
-            image, image_meta, gt_class_id, gt_bbox, gt_mask = load_image_gt(self.dataset, self.inference_model.config,
+            image, image_meta, gt_class_id, gt_bbox, gt_mask = load_image_gt(dataset, config,
                                                                              image_id)
-            molded_images = np.expand_dims(mold_image(image, self.inference_model.config), 0)
-            results = self.inference_model.detect(molded_images, verbose=0)
+            
+
+            #molded_images = np.expand_dims(mold_image(image, self.inference_model.config), 0)
+            # Compute effective scale (same as before)
+            # info = dataset.image_info[image_id]
+            # original_height = info.get("height", image.shape[0])
+            # original_width = info.get("width", image.shape[1])
+            # original_scale = info.get("scale", 1.0)
+            # resized_height, resized_width = molded_images.shape[:2]
+            # effective_scale = original_scale * (resized_height / original_height)
+
+            # GT clusters (if used) - resize as before
+            gt_clusters = None
+            if getattr(dataset, "load_cluster_as_input", False) and getattr(config, "PP_USE_GT_CLUSTERS", False):
+                gt_clusters = dataset.load_cluster_input_masks(image_id)
+                if gt_clusters.size != 0:
+                    _, window, scale, padding, crop = utils.resize_image(
+                        dataset.load_image(image_id),
+                        min_dim=config.IMAGE_MIN_DIM,
+                        min_scale=config.IMAGE_MIN_SCALE,
+                        max_dim=config.IMAGE_MAX_DIM,
+                        mode=config.IMAGE_RESIZE_MODE,
+                    )
+                    gt_clusters = utils.resize_mask(gt_clusters, scale, padding, crop)
+                else:
+                    gt_clusters = None
+
+            results = self.inference_model.detect([image],
+                              gt_cluster_masks=[gt_clusters] if gt_clusters is not None else None,
+                               verbose=0)
+            #results = self.inference_model.detect(molded_images, verbose=0)
             r = results[0]
             # Compute mAP - VOC uses IoU 0.5
             AP, _, _, _ = utils.compute_ap(gt_bbox, gt_class_id, gt_mask, r["rois"],
@@ -100,7 +216,9 @@ class MeanAveragePrecisionCallback(keras.callbacks.Callback):
         return np.array(AP50s), np.array(mAPs_COCO)
     
 
+
 class TrainingLogger(keras.callbacks.Callback):
+
     def __init__(self, train_model, log_dir=None, dataset_train=None,dataset_val=None,
                  init_with = "coco", manual_weights_path=None, 
                  scheduled_epochs=None, stage_name=None, metric_log_cats = None, verbose=1):
@@ -114,7 +232,7 @@ class TrainingLogger(keras.callbacks.Callback):
         """
         super().__init__()
         self.train_model = train_model
-        self.log_dir = log_dir or model.log_dir
+        self.log_dir = log_dir or train_model.log_dir
         self.dataset_train = dataset_train
         self.dataset_val = dataset_val
         self.init_with = init_with
@@ -136,8 +254,8 @@ class TrainingLogger(keras.callbacks.Callback):
         self.metric_log_cats = metric_log_cats
         self.predefined_cats = {
             "mAP": ["val_AP50", "val_mAP_coco"],
-            "loss": ["loss", "val_loss"],
-            "general": ["loss","val_loss", "val_AP50", "val_mAP_coco"]
+            "loss": ["loss", "val_loss", "mrcnn_mask_loss", "val_mrcnn_mask_loss", "pp_coverage_loss","val_pp_coverage_loss"],
+            "general": ["loss","val_loss",  "mrcnn_mask_loss", "val_mrcnn_mask_loss", "pp_coverage_loss","val_pp_coverage_loss","val_AP50", "val_mAP_coco"]
         }
 
         #internal storage
@@ -166,6 +284,25 @@ class TrainingLogger(keras.callbacks.Callback):
         if self.verbose:
             print(*args, **kwargs)
 
+    def _get_dataset_info(self, dataset):
+        if not dataset:
+            return None
+        
+        classes = [c.lower() for c in dataset.class_names]
+        mask_info =  {}
+
+        if "particle" in classes and getattr(dataset, "particle_masks_dir", None):
+            mask_info["particle"] = dataset.particle_masks_dir
+
+        if "cluster" in classes and getattr(dataset, "cluster_masks_dir", None):
+            mask_info["cluster"] = dataset.cluster_masks_dir
+
+        return {
+            "classes": dataset.class_names,
+            "mask_paths": mask_info,
+            "num_images": len(dataset.image_ids)
+            }
+
     def _save_initial_info(self):
         #ONLY WRITIE if log file does not exist
         if not os.path.exists(self.logfile_path):
@@ -177,25 +314,32 @@ class TrainingLogger(keras.callbacks.Callback):
             self.log_data["config"] = simple_config_dict
 
             if self.dataset_train:
-                self.log_data["datasets"]["train"] = {
-                    "path": getattr(self.dataset_train, "particle_masks_dir",None),
-                    "num_images": len(self.dataset_train.image_ids)
-                }
+                
+                self.log_data["datasets"]["train"] = self._get_dataset_info(self.dataset_train)
+                
+                #{
+                #    "path": getattr(self.dataset_train, "particle_masks_dir",None),
+                #    "num_images": len(self.dataset_train.image_ids)
+                #}
 
             if self.dataset_val:
-                self.log_data["datasets"]["val"] = {
-                    "path": getattr(self.dataset_val, "particle_masks_dir",None),
-                    "num_images": len(self.dataset_val.image_ids)
-                }
+                self.log_data["datasets"]["val"] = self._get_dataset_info(self.dataset_val)
+                
+                #{
+                #    "path": getattr(self.dataset_val, "particle_masks_dir",None),
+                #    "num_images": len(self.dataset_val.image_ids)
+                #}
 
             self._write_yaml()
             self._verbose_print(f"Training log saved to {self.logfile_path}")
-            
+
+
     def _get_metrics_for_epoch(self, logs):
         logs = logs or {}
         if self.metric_log_cats == "all":
-            #log all keys in logs
-            keys = list(logs.keys)
+            #log all keys in logs 
+
+            keys = list(logs.keys())
         else:
             keys = self.predefined_cats.get(self.metric_log_cats,[])
         values = []
@@ -211,6 +355,10 @@ class TrainingLogger(keras.callbacks.Callback):
         full_config_dict = {k: getattr(self.config, k) 
                             for k in dir(self.config) 
                             if not k.startswith('_') and not callable(getattr(self.config, k))}
+        
+        #add training schedule if it exists
+        if hasattr(self.config, "TRAIN_SCHEDULE"):
+            full_config_dict["TRAIN_SCHEDULE"] = self.config.TRAIN_SCHEDULE
 
         # ensure directory exists
         os.makedirs(self.log_dir, exist_ok=True)
@@ -247,7 +395,8 @@ class TrainingLogger(keras.callbacks.Callback):
     # ------Callback methods------        
 
     def on_train_begin(self, logs=None):
-        
+        if self.stage_name is None:
+            self.stage_name = f"stage_{len(self.log_data['training_stages'])+1}"
         #store timestamp for start time
         self.stage_start_time = time.time()
         self.stage_epoch_times_total = 0.0
@@ -313,6 +462,7 @@ class TrainingLogger(keras.callbacks.Callback):
         current_loss = epoch_entry["losses"].get("val_loss", float("inf"))
         if current_loss < best_loss:
             self.best_epoch = epoch_entry
+        
         
         stage_summary = {
             "stage": self.stage_name,
