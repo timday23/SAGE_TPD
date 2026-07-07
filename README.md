@@ -20,9 +20,16 @@ Please cite the corresponding paper for any work related to using SAGE models fo
     - SAGE<sub>2</sub>: Further fine-tuned model, trained on a second set of manual segmentations for better generalization.
     - COCO<sub>1</sub>: Model trained using same images/segmentations as SAGE<sub>1</sub>, but initialized on COCO weights rather than SAGE<sub>0</sub> weights
     - COCO<sub>2</sub>: Model trained using same images/segmentations as SAGE<sub>1</sub>, but initialized with COCO<sub>1</sub> model rather than SAGE<sub>1</sub>
+
+- **Updated Pretrained Models**:
+    - SAGE<sub>1-exp</sub>: Fine-tuned version of SAGE<sub>0</sub>, trained further on additional manual segmentations from mixed sources and scales.
+    - SAGE<sub>1-exp-N</sub>: Fine-tuned version of SAGE<sub>0</sub>, trained on scale-normalized images from mixed sources.
+ 
+    - 
 - **Model Visualizations**: Visualize and save predictions made by SAGE models on your dataset (`SAGE_ANALYZE.ipynb`)
 - **Model Comparison**: Compare various model's performance metrics (`SAGE_ANALYZE.ipynb`)
 - **Geometry Extraction**: Extract morphological information (dp, Rg, dF, etc) from TEM images (`SAGE_ANALYZE.ipynb`)
+- **Geometry Data Analysis**: Analyze morphological trends (particle size distributions, aggregate metrics aggrement plots, etc) from extracted morphology. (`SAGE_POSTPROCESS`) 
 
 ## Installation
 
@@ -74,6 +81,9 @@ This notebook demonstrates the process for training a model to detect primary pa
 
 ### SAGE_ANALYZE
 This notebook demonstrates how to perform analysis of images using trained models, as well as methods to compare performance between different models.
+
+### SAGE_POSTPROCESS
+This notebook is used for data analysis of saved morphological information extracted via models for comparison against ground truth and other models.
 
 
 ## Hardware information
