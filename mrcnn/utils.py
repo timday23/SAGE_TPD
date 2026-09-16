@@ -53,7 +53,10 @@ COCO_MODEL_URL = "https://github.com/matterport/Mask_RCNN/releases/download/v2.0
 #URL from which to download zip of SAGE pretrained models
 PRETRAIN_URL = "https://github.com/timday23/SAGE_TPD/releases/download/v1.1.0/pretrained_models.zip"
 
+
 Final_v1_URL = "https://github.com/timday23/SAGE_TPD/releases/download/Datasets/Final_v1.zip"
+
+Synth_40_URL = "https://github.com/timday23/SAGE_TPD/releases/download/Datasets/Synth_40.zip"
 
 
 ############################################################
@@ -942,7 +945,13 @@ def download_datasets(data_dir, force=False, test_mode=False, verbose=1):
     expected = [
         "Final_Trainv1_norm",
         "Final_Valv1_norm",
-        "Final_Testv1_norm"
+        "Final_Testv1_norm",
+        "Final_Trainv1",
+        "Final_Valv1",
+        "Final_Testv1",
+        "NS40_train",
+        "NS40_val",
+        "NS40_test"
     ]
 
     #Check if already exists
@@ -952,44 +961,53 @@ def download_datasets(data_dir, force=False, test_mode=False, verbose=1):
                 print("Dataset already exists. Skipping download.")
             return
 
-    zip_path = os.path.join(data_dir, "datasets.zip")
 
-    #Download
-    if verbose:
-        print("Downloading datasets...")
+    zip_urls = [Final_v1_URL, Synth_40_URL]
 
-    with urllib.request.urlopen(Final_v1_URL) as resp, open(zip_path, 'wb') as out:
-        shutil.copyfileobj(resp, out)
 
-    #Extract
-    if verbose:
-        print("[SAGE] Extracting")
 
-    with zipfile.ZipFile(zip_path, 'r') as z:
-        
-        names = z.namelist()
+    for zip_url in zip_urls:
+        zip_name = os.path.basename(zip_url).split("?")[0]
+        zip_path = os.path.join(data_dir, zip_name)
 
+        # zip_path = os.path.join(data_dir, "datasets.zip")
+
+        #Download
         if verbose:
-            print("[SAGE] ZIP sample entries:", names[:5])
+            print(f"Downloading {zip_name}...")
 
-        for member in z.namelist():
+        with urllib.request.urlopen(zip_url) as resp, open(zip_path, 'wb') as out:
+            shutil.copyfileobj(resp, out)
 
-            #skip directory entries:
-            if member.endswith('/'):
-                continue
+        #Extract
+        if verbose:
+            print("[SAGE] Extracting")
 
-            parts=member.split('/')
+        with zipfile.ZipFile(zip_path, 'r') as z:
+        
+            names = z.namelist()
 
-            #remove top-level directory
-            relative_path = os.path.join(*parts[1:])
-            target_path = os.path.join(data_dir, relative_path)
+            if verbose:
+                print("[SAGE] ZIP sample entries:", names[:5])
 
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            for member in z.namelist():
 
-            with open(target_path, 'wb') as f:
-                f.write(z.read(member))
+                #skip directory entries:
+                if member.endswith('/'):
+                    continue
 
-    os.remove(zip_path)
+                parts=member.split('/')
+
+                #remove top-level directory
+                relative_path = os.path.join(*parts[1:])
+                target_path = os.path.join(data_dir, relative_path)
+
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+                with open(target_path, 'wb') as f:
+                    f.write(z.read(member))
+
+        os.remove(zip_path)
 
     # if not all(os.path.exists(os.path.join(data_dir, d)) for d in expected):
     #     raise RuntimeError("[SAGE] Dataset extraction failed or structure mismatch.")
