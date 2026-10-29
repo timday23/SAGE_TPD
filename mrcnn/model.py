@@ -26,7 +26,7 @@ import tensorflow.keras.models as KM
 from tensorflow.keras.callbacks import EarlyStopping
 
 
-from mrcnn.custom_losses import fisher_loss, equip_loss, PPLossLayerV3, BBoxCoverageVisualizer
+#from mrcnn.custom_losses import fisher_loss, equip_loss, PPLossLayerV3, BBoxCoverageVisualizer
 
 from mrcnn import utils
 import sys
